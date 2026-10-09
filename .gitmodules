@@ -1,0 +1,3 @@
+[submodule "projects/jev-moderation-engine"]
+	path = projects/jev-moderation-engine
+	url = https://github.com/Banny-Office/jev-moderation-engine.git

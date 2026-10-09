@@ -1,3 +1,5 @@
+> **Banny-Office workspace:** organization branch and private child project details are in [BANNY-OFFICE.md](BANNY-OFFICE.md). Upstream documentation follows.
+
 
 <div align="center">
 
