@@ -10,7 +10,7 @@
  */
 
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from "fs";
-import { join, basename, relative } from "path";
+import { join, relative } from "path";
 import Graph from "graphology";
 import type DatabaseType from "better-sqlite3";
 import pLimit, { type LimitFunction } from "p-limit";
@@ -33,8 +33,6 @@ import {
   withWriteDb,
   evictWikiDb,
   readSourceStates,
-  recordSourceIngestResult,
-  deleteSources,
   classifySources,
   sha256,
   type SourceStatus,
@@ -42,57 +40,14 @@ import {
 import { createLogger } from "../../logger.js";
 import { withSpan } from "../../telemetry.js";
 import { getIngestConcurrency } from "../../config.js";
-import { slugify } from "./ingest-v2/slug.js";
+import { HIDDEN_TYPES, tokenize, writeIndex, scanWikiDir } from "./index-builder.js";
+export { tokenize } from "./index-builder.js";
+import { rebuildWikiIndex } from "./index-worker-client.js";
 import { DEFAULT_SCHEMA, DEFAULT_PURPOSE } from "./ingest-v2/template.js";
 
 const log = createLogger("wiki-mgr");
 
 // ── 内联 frontmatter/wikilink 解析（不依赖外部模块，确保可编译） ──
-
-function extractFrontmatter(content: string): { title: string; type: string; sources: string[]; description: string } {
-  const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
-  const fm = fmMatch ? fmMatch[1] : "";
-  const titleMatch = fm.match(/^title:\s*["']?(.+?)["']?\s*$/m);
-  const typeMatch = fm.match(/^type:\s*["']?(.+?)["']?\s*$/m);
-  const descMatch = fm.match(/^description:\s*["']?(.+?)["']?\s*$/m);
-  const sources: string[] = [];
-  const sourcesBlockMatch = fm.match(/^sources:\s*\n((?:\s+-\s+.+\n?)*)/m);
-  if (sourcesBlockMatch) {
-    for (const line of sourcesBlockMatch[1].split("\n")) {
-      const itemMatch = line.match(/^\s+-\s+["']?(.+?)["']?\s*$/);
-      if (itemMatch) sources.push(itemMatch[1]);
-    }
-  } else {
-    const inlineMatch = fm.match(/^sources:\s*\[([^\]]*)\]/m);
-    if (inlineMatch) {
-      for (const item of inlineMatch[1].split(",")) {
-        const trimmed = item.trim().replace(/^["']|["']$/g, "");
-        if (trimmed) sources.push(trimmed);
-      }
-    }
-  }
-  let title = titleMatch ? titleMatch[1].trim() : "";
-  if (!title) {
-    const headingMatch = content.match(/^#\s+(.+)$/m);
-    title = headingMatch ? headingMatch[1].trim() : "";
-  }
-  return {
-    title,
-    type: typeMatch ? typeMatch[1].trim().toLowerCase() : "other",
-    sources,
-    description: descMatch ? descMatch[1].trim() : "",
-  };
-}
-
-function extractWikilinks(content: string): string[] {
-  const links: string[] = [];
-  const regex = /\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]/g;
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(content)) !== null) {
-    links.push(match[1].trim());
-  }
-  return links;
-}
 
 // ── Manager Interface ──
 
@@ -155,6 +110,7 @@ export interface IngestExecOptions {
 export interface WikiSourceManager {
   register(config: WikiSourceConfig): WikiSourceState;
   sync(name: string): WikiSourceState;
+  syncAsync(name: string): Promise<WikiSourceState>;
   get(name: string): WikiSourceState | undefined;
   list(): WikiSourceState[];
   remove(name: string): void;
@@ -167,7 +123,7 @@ export interface WikiSourceManager {
 }
 
 /** 图谱中不参与建边/展示的页类型（如内部 query 页）。 */
-const HIDDEN_TYPES = new Set(["query"]);
+
 
 // ── 图谱缓存结构（读时从 index.db 的 graph_edge 临时构建） ──
 
@@ -197,33 +153,6 @@ interface PageMeta {
  * 解析页间 wikilink，产出有向边（source → target）用于写入 graph_edge。
  * 只在 visible（非 hidden 类型）页之间建边，过滤自环与无法解析的坏链接，(source,target) 去重。
  */
-function resolveEdges(pages: WikiPage[]): Array<{ source: string; target: string }> {
-  const visible = pages.filter((p) => !HIDDEN_TYPES.has(p.type));
-  const out: Array<{ source: string; target: string }> = [];
-  if (visible.length === 0) return out;
-
-  const nodeIds = new Set(visible.map((p) => p.id));
-  // title 的 slug → page id 映射：支持 wikilink 以页面标题（而非文件名）引用。
-  const titleSlugToId = new Map<string, string>();
-  for (const p of visible) {
-    const ts = slugify(p.title);
-    if (ts && !titleSlugToId.has(ts)) titleSlugToId.set(ts, p.id);
-  }
-
-  const seen = new Set<string>();
-  for (const page of visible) {
-    for (const targetRaw of page.links) {
-      const targetId = resolveTarget(targetRaw, nodeIds, titleSlugToId);
-      if (!targetId || targetId === page.id) continue;
-      const key = `${page.id}\u0000${targetId}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push({ source: page.id, target: targetId });
-    }
-  }
-  return out;
-}
-
 /**
  * 从 page_meta + graph_edge 构建内存 PageGraph（读路径）。
  * 节点 = 非 hidden 类型的页；边 = graph_edge 有向边，公共 view 无向去重。
@@ -277,101 +206,7 @@ function buildPageGraphFromDb(
   return { view: { nodes, edges, communities: [] }, graph, outAdj, inAdj, degree };
 }
 
-function resolveTarget(
-  raw: string,
-  nodeIds: Set<string>,
-  titleSlugToId: Map<string, string>,
-): string | null {
-  if (nodeIds.has(raw)) return raw;
-
-  // wikilink 目标可能是各种花式写法（带 .md 后缀、带斜杠路径、中英混合、大小写不一）。
-  // 统一用与文件名同源的 slugify 归一后比对 page id 的 basename（单一事实源，
-  // 避免在此重复造一套归一逻辑）。slugify 把 `/`、空格、标点都当段边界，
-  // 故 "/v3/wiki/create 接口" 与 "v3-wiki-create-接口" 归一后一致。
-  const target = slugify(raw.replace(/\.md$/i, ""));
-  if (!target) return null;
-
-  const rawLower = raw.toLowerCase();
-  for (const id of nodeIds) {
-    if (id.toLowerCase() === rawLower) return id;
-    const idBasename = id.split("/").pop() ?? id;
-    if (slugify(idBasename) === target) return id;
-  }
-  // 回退：按页面标题的 slug 命中（wikilink 用页面标题而非文件名引用时）。
-  const byTitle = titleSlugToId.get(target);
-  if (byTitle) return byTitle;
-  return null;
-}
-
 // ── Search Engine (SQLite FTS5) ──
-
-const STOP_WORDS = new Set([
-  "的", "是", "了", "什么", "在", "有", "和", "与", "对", "从",
-  "the", "is", "a", "an", "what", "how", "are", "was", "were",
-  "do", "does", "did", "be", "been", "being", "have", "has", "had",
-  "it", "its", "in", "on", "at", "to", "for", "of", "with", "by",
-  "this", "that", "these", "those",
-]);
-
-const SNIPPET_CONTEXT = 80;
-
-/**
- * 预生成页摘要（写入 page_meta.snippet）：优先 frontmatter description，
- * 否则取正文（去 frontmatter/标题）前 SNIPPET_CONTEXT 个字符。
- * 正文不入库，检索时直接返回该静态摘要（消费者主要是 AI，无需按 query 动态高亮）。
- */
-function makeSnippet(page: WikiPage): string {
-  if (page.description) return page.description;
-  const body = page.content
-    .replace(/^---\n[\s\S]*?\n---\n?/, "")
-    .replace(/^#+\s+.*$/gm, "")
-    .trim();
-  return [...body].slice(0, SNIPPET_CONTEXT).join("").replace(/\n/g, " ").trim();
-}
-
-/**
- * 分词器：中英文混合处理。
- * - 英文：按空格/标点切分，保留完整单词，过滤 stop words
- * - 中文：bigram + 单字
- *
- * 导出供 FTS5 预分词复用（006）与 bm25 评测：写入 FTS5 时把 content/title
- * 经此函数分词后以空格拼接存入，查询时对 query 用同一分词，保证中文逻辑一致。
- */
-export function tokenize(text: string): string[] {
-  const rawTokens = text
-    .toLowerCase()
-    .split(/[\s,，。！？、；：""''（）()\-_/\\·~～…\[\]【】{}《》<>]+/)
-    .filter((t) => t.length > 0);
-
-  const result: string[] = [];
-  for (const token of rawTokens) {
-    const hasCJK = /[\u4e00-\u9fff\u3400-\u4dbf]/.test(token);
-    const hasLatin = /[a-z]/.test(token);
-
-    if (hasCJK && hasLatin) {
-      // 混合 token（如 "l0录入"）：拆分中英文部分分别处理
-      const parts = token.split(/(?<=[a-z0-9])(?=[\u4e00-\u9fff])|(?<=[\u4e00-\u9fff])(?=[a-z0-9])/);
-      for (const part of parts) {
-        if (/[\u4e00-\u9fff]/.test(part) && part.length > 1) {
-          const chars = [...part];
-          for (let i = 0; i < chars.length - 1; i++) result.push(chars[i] + chars[i + 1]);
-          result.push(part);
-        } else if (part.length > 0 && !STOP_WORDS.has(part)) {
-          result.push(part);
-        }
-      }
-    } else if (hasCJK && token.length > 1) {
-      // 纯中文：bigram
-      const chars = [...token];
-      for (let i = 0; i < chars.length - 1; i++) result.push(chars[i] + chars[i + 1]);
-      result.push(token);
-    } else if (!STOP_WORDS.has(token) && token.length > 0) {
-      // 纯英文/数字：保留完整 token
-      result.push(token);
-    }
-  }
-  return result;
-}
 
 /**
  * FTS5 检索：query → tokenize → 每 token 加 `*` 前缀 → OR 连接 → MATCH。
@@ -391,26 +226,6 @@ function ftsSearch(db: DatabaseType.Database, query: string, limit: number): Arr
 }
 
 /** 事务内重建三张索引表（wiki_fts + page_meta + graph_edge）。由 withWriteDb 调用。 */
-function writeIndex(db: DatabaseType.Database, pages: WikiPage[]): void {
-  db.prepare("DELETE FROM wiki_fts").run();
-  db.prepare("DELETE FROM page_meta").run();
-  db.prepare("DELETE FROM graph_edge").run();
-
-  const insFts = db.prepare("INSERT INTO wiki_fts(page_id, title_tok, content_tok) VALUES (?,?,?)");
-  const insMeta = db.prepare(
-    "INSERT INTO page_meta(page_id, title, type, rel_path, snippet) VALUES (?,?,?,?,?)",
-  );
-  const insEdge = db.prepare("INSERT OR IGNORE INTO graph_edge(source_id, target_id) VALUES (?,?)");
-
-  for (const p of pages) {
-    // wiki_fts + page_meta 收录所有页（含 hidden 类型，供检索）。
-    insFts.run(p.id, tokenize(p.title).join(" "), tokenize(p.content).join(" "));
-    insMeta.run(p.id, p.title, p.type, p.relPath, makeSnippet(p));
-  }
-  // graph_edge 只在 visible 页间。
-  for (const e of resolveEdges(pages)) insEdge.run(e.source, e.target);
-}
-
 /** 从读连接加载读模型：页元数据表 + 图（graph_edge 构建的内存图）。 */
 function loadReadModel(db: DatabaseType.Database): { pg: PageGraph; metaById: Map<string, PageMeta> } {
   const metaRows = db
@@ -813,31 +628,6 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
     } catch { /* fresh start */ }
   }
 
-  function scanWikiDir(projectPath: string): WikiPage[] {
-    const wikiDir = join(projectPath, "wiki");
-    if (!existsSync(wikiDir)) throw new Error(`wiki/ not found: ${wikiDir}`);
-    const pages: WikiPage[] = [];
-    scanRecursive(wikiDir, wikiDir, pages);
-    return pages;
-  }
-
-  function scanRecursive(baseDir: string, dir: string, pages: WikiPage[]) {
-    for (const entry of readdirSync(dir)) {
-      const full = join(dir, entry);
-      const stat = statSync(full);
-      if (stat.isDirectory()) { if (entry !== "media") scanRecursive(baseDir, full, pages); }
-      else if (entry.endsWith(".md")) {
-        try {
-          const content = readFileSync(full, "utf-8");
-          const rel = full.slice(baseDir.length + 1);
-          const id = rel.replace(/\.md$/, "").replace(/\\/g, "/");
-          const fm = extractFrontmatter(content);
-          pages.push({ id, title: fm.title || basename(entry, ".md").replace(/-/g, " "), type: fm.type, path: full, relPath: `wiki/${rel}`, content, sources: fm.sources, links: extractWikilinks(content), description: fm.description });
-        } catch { /* skip */ }
-      }
-    }
-  }
-
   /** 重建 wiki 的 index.db 索引（幂等建库 → 事务重建三表 → 驱逐读连接防 stale）。 */
   function rebuildIndex(name: string, pages: WikiPage[]) {
     const state = sources.get(name);
@@ -859,50 +649,52 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
       return { results: [], links: [], count: 0 };
     }
 
-    const hop = clamp(options.hop ?? DEFAULT_HOP, 0, HOP_LIMIT);
-    const decay = clamp(options.decay ?? DEFAULT_DECAY, 0, 1);
-    const minScore = options.minScore ?? DEFAULT_MIN_SCORE;
-    const finalLimit = limit > 0 ? limit : DEFAULT_LIMIT;
+    return db.transaction(() => {
+      const hop = clamp(options.hop ?? DEFAULT_HOP, 0, HOP_LIMIT);
+      const decay = clamp(options.decay ?? DEFAULT_DECAY, 0, 1);
+      const minScore = options.minScore ?? DEFAULT_MIN_SCORE;
+      const finalLimit = limit > 0 ? limit : DEFAULT_LIMIT;
 
-    // Pull a slightly oversized seed pool so graph expansion still has something
-    // to walk from when `limit` is small but `hop>0` is requested.
-    const seedPoolSize = Math.max(finalLimit, hop > 0 ? finalLimit * 2 : finalLimit);
-    const rawSeeds = ftsSearch(db, query, seedPoolSize);
-    if (rawSeeds.length === 0) {
-      return { results: [], links: [], count: 0 };
-    }
+      // Pull a slightly oversized seed pool so graph expansion still has something
+      // to walk from when `limit` is small but `hop>0` is requested.
+      const seedPoolSize = Math.max(finalLimit, hop > 0 ? finalLimit * 2 : finalLimit);
+      const rawSeeds = ftsSearch(db, query, seedPoolSize);
+      if (rawSeeds.length === 0) {
+        return { results: [], links: [], count: 0 };
+      }
 
-    const { pg, metaById } = loadReadModel(db);
+      const { pg, metaById } = loadReadModel(db);
 
-    let hits: { id: string; score: number; hop: number; via?: string }[];
-    if (hop === 0) {
-      hits = rawSeeds.slice(0, finalLimit).map((s) => ({ id: s.id, score: s.score, hop: 0 }));
-    } else {
-      hits = graphMultiHopSearch(pg.graph, rawSeeds, { hop, decay, minScore, maxNodes: EXPANSION_CAP });
-      hits = hits.slice(0, finalLimit);
-    }
+      let hits: { id: string; score: number; hop: number; via?: string }[];
+      if (hop === 0) {
+        hits = rawSeeds.slice(0, finalLimit).map((s) => ({ id: s.id, score: s.score, hop: 0 }));
+      } else {
+        hits = graphMultiHopSearch(pg.graph, rawSeeds, { hop, decay, minScore, maxNodes: EXPANSION_CAP });
+        hits = hits.slice(0, finalLimit);
+      }
 
-    const results: SearchResult[] = [];
-    const resultIds: string[] = [];
-    for (const hit of hits) {
-      const meta = metaById.get(hit.id);
-      if (!meta) continue;
-      const result: SearchResult = {
-        path: meta.relPath,
-        title: meta.title,
-        snippet: meta.snippet,
-        score: hit.score,
-        type: meta.type,
-        hop: hit.hop,
-        related: buildRelated(meta.id, pg, metaById),
-      };
-      if (hit.hop > 0 && hit.via) result.via = hit.via;
-      results.push(result);
-      resultIds.push(meta.id);
-    }
+      const results: SearchResult[] = [];
+      const resultIds: string[] = [];
+      for (const hit of hits) {
+        const meta = metaById.get(hit.id);
+        if (!meta) continue;
+        const result: SearchResult = {
+          path: meta.relPath,
+          title: meta.title,
+          snippet: meta.snippet,
+          score: hit.score,
+          type: meta.type,
+          hop: hit.hop,
+          related: buildRelated(meta.id, pg, metaById),
+        };
+        if (hit.hop > 0 && hit.via) result.via = hit.via;
+        results.push(result);
+        resultIds.push(meta.id);
+      }
 
-    const links = buildResultLinks(resultIds, pg, metaById);
-    return { results, links, count: results.length };
+      const links = buildResultLinks(resultIds, pg, metaById);
+      return { results, links, count: results.length };
+    })();
   }
 
   loadState();
@@ -971,6 +763,29 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
     return state;
   }
 
+  async function syncAsync(name: string): Promise<WikiSourceState> {
+    const state = sources.get(name);
+    if (!state) throw new Error(`Not found: ${name}`);
+    const started = Date.now();
+    try {
+      const result = await rebuildWikiIndex({ path: state.path });
+      evictWikiDb(name);
+      state.status = "ready";
+      state.pageCount = result.pageCount;
+      state.lastSyncAt = new Date().toISOString();
+      state.error = undefined;
+      persist();
+      log.info("isolated index published", { name, pageCount: result.pageCount, ms: Date.now() - started });
+      return state;
+    } catch (error) {
+      state.status = "error";
+      state.error = String(error);
+      persist();
+      log.error("isolated index failed", { name, error: String(error) });
+      throw error;
+    }
+  }
+
   function init(config: WikiSourceConfig): WikiSourceState {
     initWikiProject(config.path);
     return register(config);
@@ -1005,11 +820,8 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
     state.status = "scanning";
     const t0 = Date.now();
     try {
-      const pages = scanWikiDir(projectPath);
-      withWriteDb(projectPath, (db) => {
-        writeIndex(db, pages);
-        for (const p of outcome.processed) recordSourceIngestResult(db, p);
-        if (outcome.deletedSources.length > 0) deleteSources(db, outcome.deletedSources);
+      const { pageCount } = await rebuildWikiIndex({
+        path: projectPath, processed: outcome.processed, deletedSources: outcome.deletedSources,
       });
       evictWikiDb(name); // 丢弃可能持旧快照的读连接
 
@@ -1023,12 +835,12 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
       }
 
       state.status = "ready";
-      state.pageCount = pages.length;
+      state.pageCount = pageCount;
       state.lastSyncAt = new Date().toISOString();
       state.error = undefined;
       log.info("ingest 完成（增量抽取 + 索引/源状态同事务重建）", {
         name,
-        pageCount: pages.length,
+        pageCount: pageCount,
         extracted: outcome.processed.length,
         failed: failed.length,
         ms: Date.now() - t0,
@@ -1045,7 +857,7 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
   }
 
   return {
-    register, sync, init, ingest,
+    register, sync, syncAsync, init, ingest,
     get: (name) => sources.get(name),
     list: () => [...sources.values()],
     remove: (name) => {
@@ -1062,7 +874,7 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
       if (!state) return { nodes: [], edges: [], communities: [] };
       try {
         const db = getReadDb(name, state.path);
-        return loadReadModel(db).pg.view;
+        return db.transaction(() => loadReadModel(db).pg.view)();
       } catch {
         return { nodes: [], edges: [], communities: [] };
       }

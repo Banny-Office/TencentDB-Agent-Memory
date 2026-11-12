@@ -17,6 +17,7 @@
  */
 
 import { Hono } from "hono";
+import { wikiOperations, wikiOperationKey } from "../wiki-operations.js";
 
 import type { WikiService } from "../store/index.js";
 import type { WikiSourceManager } from "../engines/wiki/index.js";
@@ -50,6 +51,24 @@ function maybeWriteError(outcome: unknown): Response | null {
 export function createWikiRoutes(deps: WikiRouteDeps): Hono {
   const app = new Hono();
   const { wikiService, wikiMgr, publicBaseUrl } = deps;
+
+  // Hono caches parsed JSON, so handlers can still validate the original body.
+  // Ingest keeps its existing processing-state exclusion after the 202 ACK.
+  app.use("*", async (c, next) => {
+    // Batch delete acquires one gate per wiki_ids entry below.
+    if (c.req.path.endsWith("/delete")) return next();
+    const body = await c.req.json<Record<string, unknown>>();
+    const serviceId = c.req.header("x-tdai-service-id");
+    if (!isValidIdSegment(serviceId) || !isValidIdSegment(body.wiki_id)) return next();
+    const wikiId = body.wiki_id;
+    return wikiOperations.run(wikiOperationKey(serviceId, wikiId), async () => {
+      const reading = ["/page/read", "/page/ls", "/search", "/graph"].some(route => c.req.path.endsWith(route));
+      if (reading && wikiService.getById(serviceId, wikiId) && wikiMgr.get(wikiId)?.status === "error") {
+        return c.json(wrapError(503, "Wiki index unavailable; rebuild required"), 503);
+      }
+      await next();
+    });
+  });
 
   // ═══════════════════ Asset Layer ═══════════════════
 
@@ -111,20 +130,22 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
         result.failed.push({ id: String(id), reason: "invalid id" });
         continue;
       }
-      const row = wikiService.getById(serviceId, id);
-      if (!row) {
-        result.failed.push({ id, reason: "not found" });
-        continue;
-      }
-      const ok = wikiService.delete(serviceId, row.team_id, id);
-      if (ok) {
-        // wiki engine manager 注册清理仍由路由负责（wikiMgr 未注入 service）；
-        // 连接/元数据/磁盘四类清理已在 service.cleanupResources 内完成。
-        try { wikiMgr.remove(id); } catch (err) { console.warn(`[wiki] wikiMgr.remove(${id}) failed:`, err); }
-        result.deleted_ids.push(id);
-      } else {
-        result.failed.push({ id, reason: "delete failed" });
-      }
+      await wikiOperations.run(wikiOperationKey(serviceId, id), async () => {
+        const row = wikiService.getById(serviceId, id);
+        if (!row) {
+          result.failed.push({ id, reason: "not found" });
+          return;
+        }
+        const ok = wikiService.delete(serviceId, row.team_id, id);
+        if (ok) {
+          // wiki engine manager 注册清理仍由路由负责（wikiMgr 未注入 service）；
+          // 连接/元数据/磁盘四类清理已在 service.cleanupResources 内完成。
+          try { wikiMgr.remove(id); } catch (err) { console.warn(`[wiki] wikiMgr.remove(${id}) failed:`, err); }
+          result.deleted_ids.push(id);
+        } else {
+          result.failed.push({ id, reason: "delete failed" });
+        }
+      });
     }
     return c.json(wrapOk(result));
   });
@@ -321,7 +342,8 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
       const result = await wikiService.rawRm(ids.service_id, ids.team_id, wikiId, filenames);
       const err = maybeWriteError(result);
       if (err) return err;
-      try { wikiMgr.sync(wikiId); } catch (e) { console.warn(`[wiki] wikiMgr.sync(${wikiId}) failed after raw/rm:`, e); }
+      try { await wikiMgr.syncAsync(wikiId); }
+      catch { return c.json(wrapError(503, "Wiki index rebuild failed; write may have been applied"), 503); }
       return c.json(wrapOk(result));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -410,7 +432,8 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
       const result = wikiService.pageWriteMany(ids.service_id, ids.team_id, wikiId, validated);
       const err = maybeWriteError(result);
       if (err) return err;
-      try { wikiMgr.sync(wikiId); } catch (e) { console.warn(`[wiki] wikiMgr.sync(${wikiId}) failed after page/write:`, e); }
+      try { await wikiMgr.syncAsync(wikiId); }
+      catch { return c.json(wrapError(503, "Wiki index rebuild failed; write may have been applied"), 503); }
       return c.json(wrapOk({ items: result }));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -437,7 +460,8 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
       const result = await wikiService.pageRm(ids.service_id, ids.team_id, wikiId, refs);
       const err = maybeWriteError(result);
       if (err) return err;
-      try { wikiMgr.sync(wikiId); } catch (e) { console.warn(`[wiki] wikiMgr.sync(${wikiId}) failed after page/rm:`, e); }
+      try { await wikiMgr.syncAsync(wikiId); }
+      catch { return c.json(wrapError(503, "Wiki index rebuild failed; write may have been applied"), 503); }
       return c.json(wrapOk(result));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
