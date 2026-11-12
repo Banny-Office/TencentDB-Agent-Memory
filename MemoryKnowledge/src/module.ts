@@ -198,8 +198,7 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
     );
     setInternalStatus("rebuilding-index");
 
-    const pages = wikiMgr.getPages(wikiId);
-    return { pageCount: pages.length };
+    return { pageCount: wikiMgr.get(wikiId)?.pageCount ?? 0 };
   };
 
   // Services (shared BuildQueue for serial wiki + code tasks)

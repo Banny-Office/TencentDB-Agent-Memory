@@ -1,3 +1,4 @@
+import { wikiOperations, wikiOperationKey } from "../wiki-operations.js";
 /**
  * Tools Routes — Agent self-discovery HTTP endpoints.
  *
@@ -274,7 +275,12 @@ export function createToolsRoutes(deps: ToolsRouteDeps): Hono {
       const row = wikiService.getById(serviceId, knowledgeId);
       if (!row) return c.json(wrapError(404, "wiki not found"), 404);
 
-      return executeWikiTool(serviceId, toolName, row, toolParams, wikiService, wikiMgr);
+      return wikiOperations.run(wikiOperationKey(serviceId, knowledgeId), async () => {
+        if (wikiMgr.get(knowledgeId)?.status === "error") {
+          return c.json(wrapError(503, "Wiki index unavailable; rebuild required"), 503);
+        }
+        return executeWikiTool(serviceId, toolName, row, toolParams, wikiService, wikiMgr);
+      });
     }
 
     if (isCodeGraphId(knowledgeId)) {
