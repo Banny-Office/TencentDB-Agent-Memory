@@ -41,7 +41,8 @@ export async function vectorHits(path:string,revision:string,query:string,limit:
   try {
     const work=querySlots(()=> Date.now()>=deadline ? Promise.resolve({hits:[],reason:'busy'}) : run({kind:'search',path,cfg,revision,query,limit},deadline-Date.now()));
     const result=await Promise.race([work,new Promise<{hits:[];reason:string}>(resolve=>{timer=setTimeout(()=>resolve({hits:[],reason:'timeout'}),5000);})]);
-    if(result.reason) void scheduleVectors(path);
+    if(['index_missing','index_stale','index_changed'].includes(result.reason)) void scheduleVectors(path);
+    if(!result.reason && !result.hits.length)result.reason='below_similarity_threshold';
     return result;
   } catch { return {hits:[],reason:'vector_unavailable'}; }
   finally {clearTimeout(timer);}
@@ -49,5 +50,5 @@ export async function vectorHits(path:string,revision:string,query:string,limit:
 export async function vectorStatus(path:string) {
   const cfg=vectorConfig();
   if(!cfg)return {enabled:false,ready:false};
-  return {...await run({kind:'status',path,cfg},5000),enabled:true,model:cfg.model,building:builds.has(path)};
+  return {...await run({kind:'status',path,cfg},5000),enabled:true,model:cfg.model,min_similarity:cfg.minSimilarity,building:builds.has(path)};
 }

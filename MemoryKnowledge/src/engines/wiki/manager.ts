@@ -883,7 +883,7 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
       const latest=(getReadDb(name,state.path).prepare('SELECT revision FROM index_revision WHERE id=1').get() as {revision:string}|undefined)?.revision;
       if(latest!==current){dense.hits=[];dense.reason='index_changed';void scheduleVectors(state.path);}
       const response=searchInternal(name,query,limit,options,{revision:current,hits:dense.hits});
-      response.retrieval={mode:dense.hits.length ? 'hybrid' : 'bm25',model:vectorConfig()!.model,revision:current,...(dense.reason?{fallback_reason:dense.reason}:{})};
+      response.retrieval={mode:dense.hits.length ? 'hybrid' : 'bm25',model:vectorConfig()!.model,revision:current,min_similarity:vectorConfig()!.minSimilarity,...(dense.reason?{fallback_reason:dense.reason}:{})};
       return response;
     },
     get: (name) => sources.get(name),

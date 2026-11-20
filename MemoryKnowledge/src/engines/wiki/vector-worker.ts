@@ -84,7 +84,7 @@ async function main() {
         if (row.vector.length !== job.cfg.dimension*4) throw new Error('Invalid stored vector');
         const vector = new Float32Array(row.vector.buffer.slice(row.vector.byteOffset,row.vector.byteOffset+row.vector.byteLength));
         let score=0;for(let i=0;i<query.length;i++) score+=query[i]*vector[i];
-        if(score>0) hits.push({id:row.id,score});
+        if(score>=job.cfg.minSimilarity) hits.push({id:row.id,score});
       }
       hits.sort((a,b)=>b.score-a.score || a.id.localeCompare(b.id));
       return {hits:hits.slice(0,job.limit),revision:job.revision};

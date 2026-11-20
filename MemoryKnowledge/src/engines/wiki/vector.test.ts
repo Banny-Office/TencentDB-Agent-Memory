@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createWikiSourceManager } from './manager.js';
-import { embed, normalize, vectorConfig, fuse } from './vector-shared.js';
+import { embed, normalize, vectorConfig, fuse, configId } from './vector-shared.js';
 import { wikiOperations } from '../../wiki-operations.js';
 
 const clean:Array<()=>unknown>=[];
@@ -21,12 +21,14 @@ async function fixture() {
     if(failing){res.writeHead(503);res.end('{}');return;}
     const vector=Array(4096).fill(0);
     vector[body.input[0].text.includes('天气')?1:0]=1;
+    if(body.input[0].text.includes('_below_threshold_')){vector[0]=0.8499;vector[1]=Math.sqrt(1-vector[0]**2);}
+    if(body.input[0].text.includes('_at_threshold_')){vector[0]=0.85;vector[1]=Math.sqrt(1-vector[0]**2);}
     res.setHeader('Content-Type','application/json');res.end(JSON.stringify({data:[{index:0,embedding:vector}]}));
   });
   await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
   clean.push(()=>new Promise<void>(resolve=>server.close(()=>resolve())));
   const port=(server.address() as {port:number}).port;
-  Object.assign(process.env,{KNOWLEDGE_EMBEDDING_ENABLED:'true',KNOWLEDGE_EMBEDDING_PROVIDER:'tokenhub',KNOWLEDGE_EMBEDDING_BASE_URL:`http://127.0.0.1:${port}/v1`,KNOWLEDGE_EMBEDDING_MODEL:'kinfra-vl-embedding-8b',KNOWLEDGE_EMBEDDING_API_KEY:'test-key',KNOWLEDGE_EMBEDDING_CONCURRENCY:'2',KNOWLEDGE_RETRIEVAL_MODE:'hybrid'});
+  Object.assign(process.env,{KNOWLEDGE_EMBEDDING_ENABLED:'true',KNOWLEDGE_EMBEDDING_PROVIDER:'tokenhub',KNOWLEDGE_EMBEDDING_BASE_URL:`http://127.0.0.1:${port}/v1`,KNOWLEDGE_EMBEDDING_MODEL:'kinfra-vl-embedding-8b',KNOWLEDGE_EMBEDDING_API_KEY:'test-key',KNOWLEDGE_EMBEDDING_CONCURRENCY:'2',KNOWLEDGE_RETRIEVAL_MODE:'hybrid',KNOWLEDGE_VECTOR_MIN_SIMILARITY:'0.85'});
   const root=mkdtempSync(join(tmpdir(),'wiki-vector-'));clean.push(()=>rmSync(root,{recursive:true,force:true}));
   const path=join(root,'asset');mkdirSync(join(path,'wiki'),{recursive:true});
   writeFileSync(join(path,'wiki','account.md'),'# 账号解封条件\n提交申诉审核资料。');
@@ -36,6 +38,18 @@ async function fixture() {
   return {manager,path,requests,fail:(value:boolean)=>{failing=value;},delay:(value:number)=>{delay=value;}};
 }
 describe('TokenHub hybrid retrieval',()=>{
+  it('filters below 0.85, includes the boundary, and preserves vectors across threshold changes',async()=>{
+    const {manager}=await fixture();await manager.reindexVectors('wiki-test');
+    const below=await manager.searchAsync('wiki-test','_below_threshold_',8,{hop:0});
+    expect(below.count).toBe(0);expect(below.retrieval?.min_similarity).toBe(.85);
+    expect(below.retrieval?.fallback_reason).toBe('below_similarity_threshold');
+    const boundary=await manager.searchAsync('wiki-test','_at_threshold_',8,{hop:0});
+    expect(boundary.results.map(r=>r.path)).toEqual(['wiki/account.md']);
+    expect(boundary.retrieval?.mode).toBe('hybrid');
+    const cfg=vectorConfig()!;expect(configId(cfg)).toBe(configId({...cfg,minSimilarity:0}));
+    expect(()=>vectorConfig({...process.env,KNOWLEDGE_VECTOR_MIN_SIMILARITY:'1.01'})).toThrow();
+    expect(()=>vectorConfig({...process.env,KNOWLEDGE_VECTOR_MIN_SIMILARITY:'NaN'})).toThrow();
+  });
   it('allows concurrent reads but gives a queued write priority over later reads',async()=>{
     let release!:()=>void;const hold=new Promise<void>(resolve=>{release=resolve;});const order:string[]=[];
     const one=wikiOperations.read('rw-test',async()=>{order.push('read1');await hold;});

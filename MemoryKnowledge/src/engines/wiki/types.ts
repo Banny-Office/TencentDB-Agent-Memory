@@ -72,7 +72,7 @@ export interface SearchResult {
 }
 
 export interface SearchResponse {
-  retrieval?: {mode:"bm25"|"hybrid";model:string;revision:string;fallback_reason?:string};
+  retrieval?: {mode:"bm25"|"hybrid";model:string;revision:string;min_similarity:number;fallback_reason?:string};
   results: SearchResult[];
   /** Wikilink edges where both endpoints are in `results`. */
   links: ResultLink[];

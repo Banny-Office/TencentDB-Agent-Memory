@@ -6,15 +6,17 @@ export function revision(pages: WikiPage[]): string {
   return digest(JSON.stringify(pages.map(p => [p.id, digest(p.title + '\n' + p.content)]).sort((a,b) => a[0].localeCompare(b[0]))));
 }
 export interface VectorConfig {
-  baseUrl: string; apiKey: string; model: string; dimension: number; concurrency: number;
+  baseUrl: string; apiKey: string; model: string; dimension: number; concurrency: number; minSimilarity: number;
 }
 export function vectorConfig(env = process.env): VectorConfig | undefined {
   if (env.KNOWLEDGE_EMBEDDING_ENABLED !== 'true' || env.KNOWLEDGE_EMBEDDING_PROVIDER !== 'tokenhub') return;
   const cfg = {baseUrl:(env.KNOWLEDGE_EMBEDDING_BASE_URL ?? '').replace(/\/+$/, ''),
     apiKey:env.KNOWLEDGE_EMBEDDING_API_KEY ?? '', model:env.KNOWLEDGE_EMBEDDING_MODEL ?? 'kinfra-vl-embedding-8b',
-    dimension:4096, concurrency:Number(env.KNOWLEDGE_EMBEDDING_CONCURRENCY ?? 4)};
+    dimension:4096, concurrency:Number(env.KNOWLEDGE_EMBEDDING_CONCURRENCY ?? 4),
+    minSimilarity:Number(env.KNOWLEDGE_VECTOR_MIN_SIMILARITY ?? 0.85)};
   if (!cfg.apiKey || !cfg.baseUrl || cfg.model !== 'kinfra-vl-embedding-8b' ||
-      !Number.isInteger(cfg.concurrency) || cfg.concurrency < 1 || cfg.concurrency > 8) throw new Error('Invalid TokenHub embedding configuration');
+      !Number.isInteger(cfg.concurrency) || cfg.concurrency < 1 || cfg.concurrency > 8 ||
+      !Number.isFinite(cfg.minSimilarity) || cfg.minSimilarity < 0 || cfg.minSimilarity > 1) throw new Error('Invalid TokenHub embedding configuration');
   const url = new URL(cfg.baseUrl);
   if (url.protocol !== 'https:' && url.hostname !== '127.0.0.1') throw new Error('Embedding requires HTTPS');
   return cfg;

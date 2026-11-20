@@ -13,6 +13,7 @@ KNOWLEDGE_EMBEDDING_DIMENSION=4096
 KNOWLEDGE_EMBEDDING_API_KEY=<从受保护的环境注入，不提交 Git>
 KNOWLEDGE_EMBEDDING_CONCURRENCY=4
 KNOWLEDGE_RETRIEVAL_MODE=hybrid
+KNOWLEDGE_VECTOR_MIN_SIMILARITY=0.85
 ```
 
 调用 TokenHub `/embeddings/multimodal`，每次提交一个文本块，返回一个融合向量。不能将多篇文档放在同一 input 中当作独立 batch。按 Unicode 字符每 1800 字切块，各块归一化向量求和后再次归一化为页面向量，与 DKE 的页面聚合方式一致。
@@ -23,7 +24,7 @@ KNOWLEDGE_RETRIEVAL_MODE=hybrid
 - 同一 Wiki 的只读请求允许并行，写入仍互斥并等待已有读取完成；排队的写入优先于后来的读取，避免批量审核请求被逐条串行处理。向量查询含排队在内最多等待 5 秒。
 - BM25 的同一事务发布全文内容指纹。向量构建验证磁盘快照和指纹相同，再原子发布完整页面映射；模型失败保留缓存和旧映射，不改变 Wiki 的 ready/failed 状态。
 - 向量索引按服务目录、Wiki、端点、模型、维度、分块版本隔离，位于 Wiki 的 `.hybrid/`。正文内容哈希用于复用未变化页面。删除及更新后，指纹不一致的旧向量不能参与查询。
-- 查询仅计算查询向量，余弦相似度召回与 BM25 用 RRF 融合，再沿用原有图扩展、正文路径、摘要和读取方式。
+- 查询仅计算查询向量，先保留余弦相似度 ≥ 0.85 的向量候选，再与 BM25 用 RRF 融合，再沿用原有图扩展、正文路径、摘要和读取方式。
 - 模型不可用、超过查询时间预算、向量索引缺失或落后时返回 BM25，客户端不需要处理向量服务错误。状态及日志可以区分回退和真正的混合检索。
 - 本次没有引入 reranker，也没有改变审核模型或规则。向量检索不保证最终审核准确率提高，仍须用人工标注案例验证召回和审核结果。
 
@@ -39,7 +40,9 @@ KNOWLEDGE_RETRIEVAL_MODE=hybrid
 {"retrieval":{"mode":"hybrid","model":"kinfra-vl-embedding-8b","revision":"内容指纹"}}
 ```
 
-实际回退时 mode 为 `bm25`，带 `fallback_reason`。`POST /v3/wiki/vector/status`，body 为 `{"wiki_id":"..."}`，返回当前模型、ready、building、已发布页数和缓存页数；仍需 `X-Tdai-Service-Id`，先验证 Wiki 归属。ready=false 时不能宣称该库已使用向量。
+向量阈值可通过 `KNOWLEDGE_VECTOR_MIN_SIMILARITY` 配置为 0–1，默认 0.85（包含边界）。它只作用于向量候选，不对 BM25 候选或图扩展结果做相似度过滤；返回的融合 score 也不是余弦相似度。没有合格向量候选时仍返回 BM25，标记 `fallback_reason=below_similarity_threshold`。阈值变化不改变索引版本，无需重新生成向量。
+
+响应 `retrieval.min_similarity` 和 vector/status 的 `min_similarity` 显示实际阈值。实际回退时 mode 为 `bm25`，带 `fallback_reason`。`POST /v3/wiki/vector/status`，body 为 `{"wiki_id":"..."}`，返回当前模型、ready、building、已发布页数和缓存页数；仍需 `X-Tdai-Service-Id`，先验证 Wiki 归属。ready=false 时不能宣称该库已使用向量。
 
 首次上线会在后台依次索引现有 Wiki，较小库先完成；期间该库查询使用 BM25。页面写入/删除及 ingest 成功后自动增量更新向量。模型配置在重启后生效；`KNOWLEDGE_RETRIEVAL_MODE=bm25` 可回退全文检索，向量文件不影响正文和原始材料。
 
