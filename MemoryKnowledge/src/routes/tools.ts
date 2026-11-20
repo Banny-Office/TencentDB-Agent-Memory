@@ -1,3 +1,4 @@
+import { CaseRetrievalUnavailable, retrievalPolicy } from '../engines/wiki/vector-shared.js';
 import { wikiOperations, wikiOperationKey } from "../wiki-operations.js";
 /**
  * Tools Routes — Agent self-discovery HTTP endpoints.
@@ -55,7 +56,7 @@ const WIKI_TOOLS: HttpToolDef[] = [
   },
   {
     name: "search",
-    description: "BM25 全文搜索 wiki 页面内容。用关键词查找相关文档。",
+    description: "搜索 wiki 页面，检索方式遵循该库的服务端策略；判例库逐条按原文向量相似度过滤。",
     params: {
       query: { type: "string", required: true, description: "搜索关键词" },
       limit: { type: "integer", required: false, default: 20, description: "返回结果数上限" },
@@ -275,7 +276,7 @@ export function createToolsRoutes(deps: ToolsRouteDeps): Hono {
       const row = wikiService.getById(serviceId, knowledgeId);
       if (!row) return c.json(wrapError(404, "wiki not found"), 404);
 
-      return wikiOperations.run(wikiOperationKey(serviceId, knowledgeId), async () => {
+      return wikiOperations.read(wikiOperationKey(serviceId, knowledgeId), async () => {
         if (wikiMgr.get(knowledgeId)?.status === "error") {
           return c.json(wrapError(503, "Wiki index unavailable; rebuild required"), 503);
         }
@@ -327,11 +328,17 @@ async function executeWikiTool(
         return Response.json(wrapError(400, "query is required"), { status: 400 });
       }
       if (row.status !== "ready") {
+        if(retrievalPolicy(wiki_id).mode==='case')return Response.json(wrapError(503,"case_vector_unavailable: wiki_not_ready"),{status:503});
         return Response.json(wrapOk({ results: [], links: [], count: 0 }));
       }
       const limit = typeof params.limit === "number" ? params.limit : 20;
-      const response = wikiMgr.search(wiki_id, query, limit);
-      return Response.json(wrapOk(response));
+      try {
+        const response = await wikiMgr.searchAsync(wiki_id, query, limit);
+        return Response.json(wrapOk(response));
+      } catch(error) {
+        if(error instanceof CaseRetrievalUnavailable)return Response.json(wrapError(503,"case_vector_unavailable: "+error.reason),{status:503});
+        throw error;
+      }
     }
     case "list_pages": {
       if (row.status !== "ready") {

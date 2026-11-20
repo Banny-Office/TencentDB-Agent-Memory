@@ -1,3 +1,4 @@
+import { CaseRetrievalUnavailable, retrievalPolicy } from '../engines/wiki/vector-shared.js';
 /**
  * Wiki Routes — 15 endpoints (Hono rewrite).
  *
@@ -61,7 +62,9 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     const serviceId = c.req.header("x-tdai-service-id");
     if (!isValidIdSegment(serviceId) || !isValidIdSegment(body.wiki_id)) return next();
     const wikiId = body.wiki_id;
-    return wikiOperations.run(wikiOperationKey(serviceId, wikiId), async () => {
+    const readOnly=['/get','/page/read','/page/ls','/raw/read','/raw/ls','/search','/graph','/vector/status'].some(route=>c.req.path.endsWith(route));
+    const gate=readOnly ? wikiOperations.read.bind(wikiOperations) : wikiOperations.run.bind(wikiOperations);
+    return gate(wikiOperationKey(serviceId, wikiId), async () => {
       const reading = ["/page/read", "/page/ls", "/search", "/graph"].some(route => c.req.path.endsWith(route));
       if (reading && wikiService.getById(serviceId, wikiId) && wikiMgr.get(wikiId)?.status === "error") {
         return c.json(wrapError(503, "Wiki index unavailable; rebuild required"), 503);
@@ -469,6 +472,15 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     }
   });
 
+  app.post('/vector/status', async c => {
+    const body=await c.req.json<Record<string,unknown>>();
+    const serviceId=c.req.header('x-tdai-service-id');
+    if(!isValidIdSegment(serviceId)||!isValidIdSegment(body.wiki_id))return c.json(wrapError(400,'service and wiki_id required'),400);
+    const row=wikiService.getById(serviceId,body.wiki_id);
+    if(!row)return c.json(wrapError(404,'wiki not found'),404);
+    return c.json(wrapOk(await wikiMgr.vectorStatus(body.wiki_id)));
+  });
+
   // ═══════════════════ Derived Views (id-only) ═══════════════════
 
   app.post("/graph", async (c) => {
@@ -502,6 +514,7 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     if (!row) return c.json(wrapError(404, "wiki not found"), 404);
 
     if (row.status !== "ready") {
+      if(retrievalPolicy(wikiId).mode==='case')return c.json(wrapError(503,"case_vector_unavailable: wiki_not_ready"),503);
       return c.json(wrapOk({ results: [], links: [], count: 0 }));
     }
 
@@ -532,8 +545,14 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
       minScore = body.minScore;
     }
 
-    const response = wikiMgr.search(wikiId, query, limit, { hop, decay, minScore });
-    return c.json(wrapOk(response));
+    if(body.retrieval !== undefined && body.retrieval !== 'bm25' && body.retrieval !== 'hybrid') return c.json(wrapError(400,'retrieval must be bm25 or hybrid'),400);
+    try {
+      const response = await wikiMgr.searchAsync(wikiId, query, limit, { hop, decay, minScore, retrieval:body.retrieval as 'bm25'|'hybrid'|undefined });
+      return c.json(wrapOk(response));
+    } catch(error) {
+      if(error instanceof CaseRetrievalUnavailable)return c.json(wrapError(503,"case_vector_unavailable: "+error.reason),503);
+      throw error;
+    }
   });
 
   return app;

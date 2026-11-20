@@ -43,6 +43,8 @@ import { getIngestConcurrency } from "../../config.js";
 import { HIDDEN_TYPES, tokenize, writeIndex, scanWikiDir } from "./index-builder.js";
 export { tokenize } from "./index-builder.js";
 import { rebuildWikiIndex } from "./index-worker-client.js";
+import { scheduleVectors, vectorHits, vectorStatus } from "./vector-client.js";
+import { CaseRetrievalUnavailable, fuse, retrievalPolicy, wikiVectorConfig } from "./vector-shared.js";
 import { DEFAULT_SCHEMA, DEFAULT_PURPOSE } from "./ingest-v2/template.js";
 
 const log = createLogger("wiki-mgr");
@@ -54,6 +56,7 @@ const log = createLogger("wiki-mgr");
 export interface SearchOptions {
   /** Multi-hop expansion depth (PRD FR-3). 0 = pure BM25. Range 0~5. */
   hop?: number;
+  retrieval?: "bm25" | "hybrid";
   /** Per-hop score decay factor (0~1). */
   decay?: number;
   /** Minimum score threshold; nodes below this are dropped. */
@@ -115,6 +118,9 @@ export interface WikiSourceManager {
   list(): WikiSourceState[];
   remove(name: string): void;
   search(name: string, query: string, limit?: number, options?: SearchOptions): SearchResponse;
+  searchAsync(name: string, query: string, limit?: number, options?: SearchOptions): Promise<SearchResponse>;
+  vectorStatus(name: string): Promise<unknown>;
+  reindexVectors(name: string): Promise<unknown>;
   graph(name: string): { nodes: GraphNode[]; edges: GraphEdge[]; communities: CommunityInfo[] };
   readPage(name: string, relPath: string): string | null;
   getPages(name: string): WikiPage[];
@@ -637,7 +643,7 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
     evictWikiDb(name); // 丢弃可能持有旧快照的读连接，下次查询重开
   }
 
-  function searchInternal(name: string, query: string, limit: number, options: SearchOptions): SearchResponse {
+  function searchInternal(name: string, query: string, limit: number, options: SearchOptions, dense?: {revision:string;hits:{id:string;score:number}[]}): SearchResponse {
     const state = sources.get(name);
     if (!state) return { results: [], links: [], count: 0 };
 
@@ -658,7 +664,9 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
       // Pull a slightly oversized seed pool so graph expansion still has something
       // to walk from when `limit` is small but `hop>0` is requested.
       const seedPoolSize = Math.max(finalLimit, hop > 0 ? finalLimit * 2 : finalLimit);
-      const rawSeeds = ftsSearch(db, query, seedPoolSize);
+      const lexical = ftsSearch(db, query, seedPoolSize);
+      const liveRevision = dense ? (db.prepare('SELECT revision FROM index_revision WHERE id=1').get() as {revision:string}|undefined)?.revision : undefined;
+      const rawSeeds = dense && liveRevision === dense.revision ? fuse(lexical,dense.hits).slice(0,seedPoolSize) : lexical;
       if (rawSeeds.length === 0) {
         return { results: [], links: [], count: 0 };
       }
@@ -775,6 +783,7 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
       state.lastSyncAt = new Date().toISOString();
       state.error = undefined;
       persist();
+      void scheduleVectors(state.path,false,wikiVectorConfig(state.name));
       log.info("isolated index published", { name, pageCount: result.pageCount, ms: Date.now() - started });
       return state;
     } catch (error) {
@@ -853,11 +862,56 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
       throw err;
     }
     persist();
+    void scheduleVectors(state.path,false,wikiVectorConfig(state.name));
     return outcome.results;
   }
 
+  for(const state of [...sources.values()].filter(s=>s.status==='ready').sort((a,b)=>(a.pageCount??0)-(b.pageCount??0))) void scheduleVectors(state.path,false,wikiVectorConfig(state.name));
   return {
     register, sync, syncAsync, init, ingest,
+    vectorStatus: async name => {
+      const state=sources.get(name),policy=retrievalPolicy(name);
+      return {...(state ? await vectorStatus(state.path,wikiVectorConfig(name)) : {enabled:false,ready:false}),
+        retrieval_mode:policy.mode==='case'?'hybrid':policy.mode,...(policy.mode==='case'?{strict_similarity:true}:{})};
+    },
+    reindexVectors: async name => {const state=sources.get(name);if(!state)throw new Error('Wiki engine not registered');return scheduleVectors(state.path,true,wikiVectorConfig(name));},
+    searchAsync: async (name,query,limit=DEFAULT_LIMIT,options={}) => {
+      const policy=retrievalPolicy(name,options.retrieval),cfg=wikiVectorConfig(name,options.retrieval);
+      const state=sources.get(name);
+      if(policy.mode==='case' && (!state || !cfg))throw new CaseRetrievalUnavailable('disabled');
+      if(policy.mode==='bm25'||!state||!cfg)return searchInternal(name,query,limit,options);
+      const db=getReadDb(name,state.path);
+      const current=(db.prepare('SELECT revision FROM index_revision WHERE id=1').get() as {revision:string}|undefined)?.revision;
+      if(!current){if(policy.mode==='case')throw new CaseRetrievalUnavailable('index_missing');return searchInternal(name,query,limit,options);}
+      const count=limit>0 ? Math.min(limit,200) : DEFAULT_LIMIT;
+      const lexical=policy.mode==='case'?ftsSearch(db,query,Math.max(count*2,20)):[];
+      const dense=await vectorHits(state.path,current,query,Math.max(count*2,20),cfg,lexical.map(hit=>hit.id));
+      const latest=(getReadDb(name,state.path).prepare('SELECT revision FROM index_revision WHERE id=1').get() as {revision:string}|undefined)?.revision;
+      if(latest!==current){dense.hits=[];dense.candidateHits=[];dense.reason='index_changed';void scheduleVectors(state.path,false,wikiVectorConfig(state.name));}
+      if(policy.mode==='case') {
+        if(dense.reason && dense.reason!=='below_similarity_threshold')throw new CaseRetrievalUnavailable(dense.reason);
+        return getReadDb(name,state.path).transaction(()=>{
+          const live=getReadDb(name,state.path);
+          if((live.prepare('SELECT revision FROM index_revision WHERE id=1').get() as {revision:string}|undefined)?.revision!==current)throw new CaseRetrievalUnavailable('index_changed');
+          const statement=live.prepare('SELECT title,type,rel_path,snippet FROM page_meta WHERE page_id=?');
+          const results:SearchResult[]=[];
+          const similarities=new Map([...dense.hits,...(dense.candidateHits??[])].filter(hit=>hit.score>=cfg.minSimilarity).map(hit=>[hit.id,hit.score]));
+          const ranked=fuse(lexical.filter(hit=>similarities.has(hit.id)),dense.hits);
+          for(const hit of ranked){
+            const similarity=similarities.get(hit.id);
+            if(similarity===undefined||similarity<cfg.minSimilarity)continue;
+            const row=statement.get(hit.id) as {title:string;type:string;rel_path:string;snippet:string}|undefined;
+            if(!row)continue;
+            results.push({path:row.rel_path,title:row.title,type:row.type,snippet:row.snippet,score:hit.score,similarity,hop:0,related:[]});
+            if(results.length>=count)break;
+          }
+          return {results,links:[],count:results.length,retrieval:{mode:'hybrid',strict_similarity:true,model:cfg.model,revision:current,min_similarity:cfg.minSimilarity,input_mode:'case_original',case_prefix:cfg.casePrefix,...(dense.reason?{empty_reason:dense.reason}:{})}} as SearchResponse;
+        })();
+      }
+      const response=searchInternal(name,query,limit,options,{revision:current,hits:dense.hits});
+      response.retrieval={mode:dense.hits.length ? 'hybrid' : 'bm25',model:cfg.model,revision:current,min_similarity:cfg.minSimilarity,input_mode:cfg.inputMode,...(dense.reason?{fallback_reason:dense.reason}:{})};
+      return response;
+    },
     get: (name) => sources.get(name),
     list: () => [...sources.values()],
     remove: (name) => {
