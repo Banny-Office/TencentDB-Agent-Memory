@@ -1,5 +1,7 @@
 # 动态文本判例库恢复记录（2026-11-20）
 
+本文记录 15:10 的恢复过程。后续于 15:51 已单独启用动态文本原文向量和 0.85 逐条过滤，当前策略见 [case-retrieval-contract.md](case-retrieval-contract.md)。
+
 对象：`wiki-j2g1em91`，Team `team-5x9sbd20oi`。
 
 ## 原因
