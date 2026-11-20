@@ -15,6 +15,7 @@ async function fixture() {
   const server:Server=createServer(async(req,res)=>{
     let raw='';for await(const chunk of req)raw+=chunk;
     const body=JSON.parse(raw);requests.push({url:req.url,...body});
+    if(!body.input[0].text.trim()){res.writeHead(400);res.end('{}');return;}
     if(delay)await new Promise(resolve=>setTimeout(resolve,delay));
     if(failing){res.writeHead(503);res.end('{}');return;}
     const vector=Array(4096).fill(0);
@@ -87,6 +88,15 @@ describe('TokenHub hybrid retrieval',()=>{
     expect(result.results.some(r=>r.path==='wiki/account.md')).toBe(false);
     expect(result.retrieval?.mode).toBe('bm25');
     await manager.reindexVectors('wiki-test');
+  });
+  it('skips a whitespace-only trailing chunk instead of failing the whole Wiki build',async()=>{
+    const {manager,path,requests}=await fixture();
+    const title='尾部空白',prefix='# '+title+'\n';
+    const content=prefix+'a'.repeat(1800-title.length-1-prefix.length)+'\n';
+    writeFileSync(join(path,'wiki','trailing.md'),content);
+    await manager.syncAsync('wiki-test');await manager.reindexVectors('wiki-test');
+    expect((await manager.vectorStatus('wiki-test') as any).ready).toBe(true);
+    expect(requests.every(r=>r.input[0].text.trim().length>0)).toBe(true);
   });
   it('validates provider configuration, vector dimensions and RRF fusion',async()=>{
     expect(()=>normalize([NaN],1)).toThrow();expect(()=>normalize([0],1)).toThrow();

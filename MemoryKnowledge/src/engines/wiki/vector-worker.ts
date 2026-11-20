@@ -43,9 +43,11 @@ async function main() {
             const chars = Array.from(item.text);
             const sum = Array<number>(job.cfg.dimension).fill(0);
             for (let offset=0;offset<chars.length;offset+=1800) {
+              const chunk=chars.slice(offset,offset+1800).join('').trim();
+              if(!chunk)continue; // TokenHub rejects whitespace-only trailing chunks.
               let vector: number[] | undefined;
               for (let attempt=0;attempt<3;attempt++) {
-                try { vector = await embed(chars.slice(offset,offset+1800).join(''),job.cfg); break; }
+                try { vector = await embed(chunk,job.cfg); break; }
                 catch (error) { if(attempt===2) throw error; await new Promise(resolve=>setTimeout(resolve,500*(attempt+1))); }
               }
               for(let i=0;i<sum.length;i++) sum[i]+=vector![i];
