@@ -61,7 +61,9 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     const serviceId = c.req.header("x-tdai-service-id");
     if (!isValidIdSegment(serviceId) || !isValidIdSegment(body.wiki_id)) return next();
     const wikiId = body.wiki_id;
-    return wikiOperations.run(wikiOperationKey(serviceId, wikiId), async () => {
+    const readOnly=['/get','/page/read','/page/ls','/raw/read','/raw/ls','/search','/graph','/vector/status'].some(route=>c.req.path.endsWith(route));
+    const gate=readOnly ? wikiOperations.read.bind(wikiOperations) : wikiOperations.run.bind(wikiOperations);
+    return gate(wikiOperationKey(serviceId, wikiId), async () => {
       const reading = ["/page/read", "/page/ls", "/search", "/graph"].some(route => c.req.path.endsWith(route));
       if (reading && wikiService.getById(serviceId, wikiId) && wikiMgr.get(wikiId)?.status === "error") {
         return c.json(wrapError(503, "Wiki index unavailable; rebuild required"), 503);

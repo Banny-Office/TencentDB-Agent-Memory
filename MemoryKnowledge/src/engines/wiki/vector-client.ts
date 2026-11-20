@@ -36,11 +36,15 @@ export async function vectorHits(path:string,revision:string,query:string,limit:
   const cfg=vectorConfig();
   if(!cfg)return {hits:[],reason:'disabled'};
   if(querySlots.pendingCount>=8)return {hits:[],reason:'busy'};
+  const deadline=Date.now()+5000;
+  let timer:ReturnType<typeof setTimeout>|undefined;
   try {
-    const result=await querySlots(()=>run({kind:'search',path,cfg,revision,query,limit},5000));
+    const work=querySlots(()=> Date.now()>=deadline ? Promise.resolve({hits:[],reason:'busy'}) : run({kind:'search',path,cfg,revision,query,limit},deadline-Date.now()));
+    const result=await Promise.race([work,new Promise<{hits:[];reason:string}>(resolve=>{timer=setTimeout(()=>resolve({hits:[],reason:'timeout'}),5000);})]);
     if(result.reason) void scheduleVectors(path);
     return result;
   } catch { return {hits:[],reason:'vector_unavailable'}; }
+  finally {clearTimeout(timer);}
 }
 export async function vectorStatus(path:string) {
   const cfg=vectorConfig();

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createWikiSourceManager } from './manager.js';
 import { embed, normalize, vectorConfig, fuse } from './vector-shared.js';
+import { wikiOperations } from '../../wiki-operations.js';
 
 const clean:Array<()=>unknown>=[];
 afterEach(async()=>{for(const fn of clean.splice(0).reverse())await fn();});
@@ -35,6 +36,17 @@ async function fixture() {
   return {manager,path,requests,fail:(value:boolean)=>{failing=value;},delay:(value:number)=>{delay=value;}};
 }
 describe('TokenHub hybrid retrieval',()=>{
+  it('allows concurrent reads but gives a queued write priority over later reads',async()=>{
+    let release!:()=>void;const hold=new Promise<void>(resolve=>{release=resolve;});const order:string[]=[];
+    const one=wikiOperations.read('rw-test',async()=>{order.push('read1');await hold;});
+    const two=wikiOperations.read('rw-test',async()=>{order.push('read2');await hold;});
+    await new Promise(resolve=>setTimeout(resolve,0));expect(order).toEqual(['read1','read2']);
+    const write=wikiOperations.run('rw-test',async()=>{order.push('write');});
+    const last=wikiOperations.read('rw-test',async()=>{order.push('last');});
+    release();await Promise.all([one,two,write,last]);expect(order).toEqual(['read1','read2','write','last']);
+    await expect(wikiOperations.read('rw-test',async()=>{throw new Error('fail');})).rejects.toThrow('fail');
+    await expect(wikiOperations.run('rw-test',async()=>'released')).resolves.toBe('released');
+  });
   it('recalls a semantic-only match through the native REST endpoint and preserves explicit BM25',async()=>{
     const {manager,requests}=await fixture();
     const before=manager.search('wiki-test','恢复使用权限',1,{hop:0});

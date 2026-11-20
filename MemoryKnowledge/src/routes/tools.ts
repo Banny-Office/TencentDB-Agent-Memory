@@ -275,7 +275,7 @@ export function createToolsRoutes(deps: ToolsRouteDeps): Hono {
       const row = wikiService.getById(serviceId, knowledgeId);
       if (!row) return c.json(wrapError(404, "wiki not found"), 404);
 
-      return wikiOperations.run(wikiOperationKey(serviceId, knowledgeId), async () => {
+      return wikiOperations.read(wikiOperationKey(serviceId, knowledgeId), async () => {
         if (wikiMgr.get(knowledgeId)?.status === "error") {
           return c.json(wrapError(503, "Wiki index unavailable; rebuild required"), 503);
         }
