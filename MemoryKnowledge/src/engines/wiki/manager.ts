@@ -897,7 +897,7 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
             results.push({path:row.rel_path,title:row.title,type:row.type,snippet:row.snippet,score:hit.score,similarity:hit.score,hop:0,related:[]});
             if(results.length>=count)break;
           }
-          return {results,links:[],count:results.length,retrieval:{mode:'case_vector',model:cfg.model,revision:current,min_similarity:cfg.minSimilarity,input_mode:'case_original',...(dense.reason?{empty_reason:dense.reason}:{})}} as SearchResponse;
+          return {results,links:[],count:results.length,retrieval:{mode:'case_vector',model:cfg.model,revision:current,min_similarity:cfg.minSimilarity,input_mode:'case_original',case_prefix:cfg.casePrefix,...(dense.reason?{empty_reason:dense.reason}:{})}} as SearchResponse;
         })();
       }
       const response=searchInternal(name,query,limit,options,{revision:current,hits:dense.hits});

@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createWikiSourceManager } from './manager.js';
-import { embed, normalize, vectorConfig, fuse, configId, caseOriginal } from './vector-shared.js';
+import { embed, normalize, vectorConfig, fuse, configId, caseOriginal, DEFAULT_CASE_PREFIX, wikiVectorConfig, retrievalPolicy } from './vector-shared.js';
 import { wikiOperations } from '../../wiki-operations.js';
 
 const clean:Array<()=>unknown>=[];
@@ -145,6 +145,33 @@ describe('strict per-Wiki case retrieval',()=>{
     expect(caseOriginal(page('# Index\n判例'))).toBeUndefined();
     expect(caseOriginal(page(casePage('原文').replace('## 规则正文','## 其他正文')))).toBeUndefined();
     expect(caseOriginal(page(casePage('长'.repeat(100)+'\n多行「原文」')))).toBe('长'.repeat(100)+'\n多行「原文」');
+  });
+  it('selects the dynamic-case prefix per Wiki without changing the existing case index identity',async()=>{
+    const dynamic='动态文本质检判例：「';
+    const {manager,path,requests}=await fixture('case');
+    process.env.KNOWLEDGE_WIKI_RETRIEVAL_POLICIES=JSON.stringify({'wiki-test0000':{mode:'case',min_similarity:.85,case_prefix:dynamic}});
+    const long='长判例'.repeat(40)+'²⁰²⁶\n完整正文「未截断」';
+    const content=casePage(long).replace('资料文本质检判例：「',dynamic);
+    expect(caseOriginal({content} as any,dynamic)).toBe(long);
+    expect(caseOriginal({content} as any)).toBeUndefined();
+    expect(caseOriginal({content:casePage('其他库原文')} as any,dynamic)).toBeUndefined();
+    writeFileSync(join(path,'wiki','dynamic.md'),content);
+    writeFileSync(join(path,'wiki','profile.md'),casePage('资料文本不应进入动态库'));
+    await manager.syncAsync('wiki-test0000');await manager.reindexVectors('wiki-test0000');
+    expect(requests.map(r=>r.input[0].text)).toContain(long);
+    expect(requests.every(r=>!r.input[0].text.includes('资料文本不应进入动态库'))).toBe(true);
+    const result=await manager.searchAsync('wiki-test0000','语义查询',8,{retrieval:'bm25',hop:5});
+    expect(result.results.map(r=>r.path)).toEqual(['wiki/dynamic.md']);
+    expect(result.retrieval?.case_prefix).toBe(dynamic);
+    const miss=await manager.searchAsync('wiki-test0000','账号 _below_threshold_',8);
+    expect(miss.count).toBe(0);expect(miss.retrieval?.empty_reason).toBe('below_similarity_threshold');
+    const status=await manager.vectorStatus('wiki-test0000') as any;
+    expect(status.pages).toBe(1);expect(status.excluded_pages).toBe(3);expect(status.case_prefix).toBe(dynamic);
+    expect(configId(vectorConfig()!)).not.toBe(configId(wikiVectorConfig('wiki-test0000')!));
+    const old={...vectorConfig()!,inputMode:'case_original' as const};
+    expect(configId(old)).toBe(configId({...old,casePrefix:DEFAULT_CASE_PREFIX}));
+    expect(configId(old)).not.toBe(configId({...old,casePrefix:dynamic}));
+    expect(()=>retrievalPolicy('wiki-test0000',undefined,{KNOWLEDGE_WIKI_RETRIEVAL_POLICIES:JSON.stringify({'wiki-test0000':{mode:'case',case_prefix:''}})})).toThrow('prefix');
   });
   it('filters final results per cosine without lexical or graph fallback and reuses original vectors after conclusion edits',async()=>{
     const {manager,path,requests}=await fixture('case');

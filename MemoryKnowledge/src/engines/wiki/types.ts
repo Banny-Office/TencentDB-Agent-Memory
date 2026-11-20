@@ -73,7 +73,7 @@ export interface SearchResult {
 }
 
 export interface SearchResponse {
-  retrieval?: {mode:"bm25"|"hybrid"|"case_vector";model:string;revision:string;min_similarity:number;input_mode?:"page"|"case_original";fallback_reason?:string;empty_reason?:string};
+  retrieval?: {mode:"bm25"|"hybrid"|"case_vector";model:string;revision:string;min_similarity:number;input_mode?:"page"|"case_original";fallback_reason?:string;empty_reason?:string;case_prefix?:string};
   results: SearchResult[];
   /** Wikilink edges where both endpoints are in `results`. */
   links: ResultLink[];

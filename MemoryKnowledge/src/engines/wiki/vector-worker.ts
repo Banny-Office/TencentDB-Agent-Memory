@@ -32,7 +32,7 @@ async function main() {
       const slots = pLimit(job.cfg.concurrency);
       const pending = new Map<string,Promise<void>>();
       const mappings = pages.flatMap(page => {
-        const text=job.cfg.inputMode==='case_original'?caseOriginal(page):page.title+'\n'+page.content;
+        const text=job.cfg.inputMode==='case_original'?caseOriginal(page,job.cfg.casePrefix):page.title+'\n'+page.content;
         return text ? [{id:page.id,hash:digest(text),text}] : [];
       });
       if(job.cfg.inputMode==='case_original' && !mappings.length)throw new Error('No case originals available');

@@ -48,5 +48,5 @@ export async function vectorHits(path:string,revision:string,query:string,limit:
 }
 export async function vectorStatus(path:string,cfg:VectorConfig|undefined) {
   if(!cfg)return {enabled:false,ready:false};
-  return {...await run({kind:'status',path,cfg},5000),enabled:true,model:cfg.model,min_similarity:cfg.minSimilarity,input_mode:cfg.inputMode,building:builds.has(path+":"+configId(cfg))};
+  return {...await run({kind:'status',path,cfg},5000),enabled:true,model:cfg.model,min_similarity:cfg.minSimilarity,input_mode:cfg.inputMode,...(cfg.inputMode==='case_original'?{case_prefix:cfg.casePrefix}:{}),building:builds.has(path+":"+configId(cfg))};
 }
