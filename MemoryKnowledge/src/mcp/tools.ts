@@ -150,7 +150,7 @@ export const MCP_TOOLS: McpToolDef[] = [
 
   {
     name: "wiki_search",
-    description: "Search wiki pages by keyword (BM25 full-text search). Optional graph multi-hop expansion (PRD: hop, decay, minScore) walks [[wikilink]] edges from BM25 seeds to surface graph-related pages whose body doesn't match the query directly. Each result also carries `related` (neighbour pages) and the response includes `links` (edges between results) for relationship visualisation.",
+    description: "Search wiki pages using the server retrieval policy, normally BM25 plus vector fusion. Case wikis filter every candidate by original-text cosine similarity before fusion; results include similarity and never use keyword or graph fallback below the threshold. Ordinary wikis support optional graph expansion and BM25 fallback on vector failure.",
     inputSchema: {
       type: "object",
       properties: {
@@ -161,7 +161,7 @@ export const MCP_TOOLS: McpToolDef[] = [
           type: "integer",
           minimum: 0,
           maximum: 5,
-          description: "Graph expansion depth. 0 = pure BM25 (default), >0 = walk wikilink edges from seeds.",
+          description: "Graph expansion depth for ordinary wikis. 0 = no expansion (default); ignored for strict case wikis.",
         },
         decay: {
           type: "number",

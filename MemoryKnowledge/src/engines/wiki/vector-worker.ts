@@ -6,7 +6,7 @@ import pLimit from 'p-limit';
 import { scanWikiDir } from './index-builder.js';
 import { caseOriginal, configId, digest, embed, normalize, revision, type VectorConfig } from './vector-shared.js';
 
-interface Job { kind:'build'|'search'|'status'; path:string; cfg:VectorConfig; revision?:string; query?:string; limit?:number }
+interface Job { kind:'build'|'search'|'status'; path:string; cfg:VectorConfig; revision?:string; query?:string; limit?:number; candidateIds?:string[] }
 const job = workerData as Job;
 const file = join(job.path,'.hybrid',configId(job.cfg)+'.db');
 function currentRevision(): string | undefined {
@@ -85,16 +85,20 @@ async function main() {
     const query = await embed(job.query!,job.cfg,2500);
     return db.transaction(() => {
       if (published(db) !== job.revision) return {hits:[],reason:'index_changed'};
-      const hits: {id:string;score:number}[]=[];
+      const hits: {id:string;score:number}[]=[],candidateHits:{id:string;score:number}[]=[];
+      const candidates=new Set(job.candidateIds??[]);
       for(const row of db.prepare('SELECT p.id,c.vector FROM pages p JOIN cache c ON c.hash=p.hash').iterate() as Iterable<{id:string;vector:Buffer}>) {
         if (row.vector.length !== job.cfg.dimension*4) throw new Error('Invalid stored vector');
         const vector = new Float32Array(row.vector.buffer.slice(row.vector.byteOffset,row.vector.byteOffset+row.vector.byteLength));
         let score=0;for(let i=0;i<query.length;i++) score+=query[i]*vector[i];
         score=Math.max(-1,Math.min(1,score));
-        if(score>=job.cfg.minSimilarity) hits.push({id:row.id,score});
+        if(score>=job.cfg.minSimilarity){
+          hits.push({id:row.id,score});
+          if(candidates.has(row.id))candidateHits.push({id:row.id,score});
+        }
       }
       hits.sort((a,b)=>b.score-a.score || a.id.localeCompare(b.id));
-      return {hits:hits.slice(0,job.limit),revision:job.revision};
+      return {hits:hits.slice(0,job.limit),candidateHits,revision:job.revision};
     })();
   } finally { db.close(); }
 }

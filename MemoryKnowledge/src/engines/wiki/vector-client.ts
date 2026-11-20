@@ -5,7 +5,7 @@ import { configId, type VectorConfig } from './vector-shared.js';
 const buildSlots=pLimit(1), querySlots=pLimit(4);
 const builds=new Map<string,Promise<unknown>>();
 const retryAfter=new Map<string,number>();
-function run(job: {kind:'build'|'search'|'status';path:string;cfg:VectorConfig;revision?:string;query?:string;limit?:number}, timeout:number):Promise<any> {
+function run(job: {kind:'build'|'search'|'status';path:string;cfg:VectorConfig;revision?:string;query?:string;limit?:number;candidateIds?:string[]}, timeout:number):Promise<any> {
   return new Promise((resolve,reject) => {
     const worker = new Worker(new URL(import.meta.url.endsWith('.ts') ? '../../../dist/vector-worker.mjs' : './vector-worker.mjs',import.meta.url),{workerData:job});
     let result:unknown, failure:Error|undefined;
@@ -32,13 +32,13 @@ export function scheduleVectors(path:string, force=false, cfg:VectorConfig|undef
   void job.catch(()=>{});
   return job;
 }
-export async function vectorHits(path:string,revision:string,query:string,limit:number,cfg:VectorConfig|undefined):Promise<{hits:{id:string;score:number}[];reason?:string}> {
+export async function vectorHits(path:string,revision:string,query:string,limit:number,cfg:VectorConfig|undefined,candidateIds:string[]=[]):Promise<{hits:{id:string;score:number}[];candidateHits?:{id:string;score:number}[];reason?:string}> {
   if(!cfg)return {hits:[],reason:'disabled'};
   if(querySlots.pendingCount>=8)return {hits:[],reason:'busy'};
   const deadline=Date.now()+5000;
   let timer:ReturnType<typeof setTimeout>|undefined;
   try {
-    const work=querySlots(()=> Date.now()>=deadline ? Promise.resolve({hits:[],reason:'busy'}) : run({kind:'search',path,cfg,revision,query,limit},deadline-Date.now()));
+    const work=querySlots(()=> Date.now()>=deadline ? Promise.resolve({hits:[],reason:'busy'}) : run({kind:'search',path,cfg,revision,query,limit,candidateIds},deadline-Date.now()));
     const result=await Promise.race([work,new Promise<{hits:[];reason:string}>(resolve=>{timer=setTimeout(()=>resolve({hits:[],reason:'timeout'}),5000);})]);
     if(['index_missing','index_stale','index_changed'].includes(result.reason)) void scheduleVectors(path,false,cfg);
     if(!result.reason && !result.hits.length)result.reason='below_similarity_threshold';

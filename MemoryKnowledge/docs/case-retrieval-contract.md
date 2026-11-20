@@ -10,12 +10,12 @@
 
 | Wiki | 方式 | 不足门槛时 |
 | --- | --- | --- |
-| 资料文本判例库 `wiki-ctrs7572` | 仅原文向量，逐条余弦相似度 ≥ 0.85，按相似度降序 | 返回空，禁止 BM25 和图扩展补齐 |
-| 动态文本判例库 `wiki-j2g1em91` | 仅原文向量，逐条余弦相似度 ≥ 0.85，按相似度降序 | 返回空，禁止 BM25 和图扩展补齐 |
-| 正式审核库 `wiki-zz5wwtdt` | 恢复原 BM25 | 保持原行为 |
-| 通用审核、客服、DKE staging 库 | 恢复原 BM25 | 保持原行为 |
+| 资料文本判例库 `wiki-ctrs7572` | BM25 + 原文向量，所有候选逐条余弦相似度 ≥ 0.85 后融合排序 | 返回空，禁止 BM25 和图扩展补齐 |
+| 动态文本判例库 `wiki-j2g1em91` | BM25 + 原文向量，所有候选逐条余弦相似度 ≥ 0.85 后融合排序 | 返回空，禁止 BM25 和图扩展补齐 |
+| 正式审核库 `wiki-zz5wwtdt` | BM25 + 页面向量，RRF 融合 | 向量不可用可回退 BM25 |
+| 通用审核、客服、DKE staging 库及新 Wiki | 默认 BM25 + 页面向量，RRF 融合 | 向量不可用可回退 BM25 |
 
-正式库恢复 BM25 后，待标注集验证再单独启用混合检索。服务端明确指定的逐库策略优先于请求中的 `retrieval`，调用方不能用 `retrieval: bm25` 绕过判例门槛，也不能用 `retrieval: hybrid` 改变已锁定的正式库排序。判例库忽略图扩展的 `hop`、`decay`、`minScore`；`limit` 是最多返回多少条，不会为了补足数量降低门槛。
+所有 Wiki 默认混合检索。普通库可显式用 `retrieval: bm25` 做诊断对照；判例库服务端策略优先，不能绕过 0.85。配置中的 `mode: case` 现在表示“严格判例混合检索”，不是纯向量检索。判例库忽略图扩展的 `hop`、`decay`、`minScore`；`limit` 是最多返回多少条，不会为了补足数量降低门槛。
 
 ## 原文的准确位置：不改页面格式
 
@@ -60,7 +60,7 @@ retrieval_text: "完整、未截断的判例原文"
 similarityᵢ = dot(E(q), E(cᵢ)) / (norm(E(q)) × norm(E(cᵢ)))
 ```
 
-逐条去掉 `similarityᵢ < 0.85`，对剩余结果排序后取前 limit 条。每条结果带 `similarity`，在本库 `score` 同样为余弦相似度；不是查询向量与标题、说明或质检结论算相似度。向量存储为 Float32，会有浮点误差，展示接近 1 即可，不应要求字符串恰为 `1`。
+BM25 和原文向量分别召回候选。所有 BM25 候选（包括没有进入向量召回前若干名的候选）也必须取得自己的原文余弦相似度；无法取得向量或 `similarityᵢ < 0.85` 的候选被丢弃。对合格的两路候选用 RRF 融合，取前 limit 条。每条结果的 `similarity` 才是原文余弦相似度；`score` 是融合排序分，不能拿来与 0.85 比较，也不承诺按 similarity 降序。不是查询向量与标题、说明或质检结论算相似度。向量存储为 Float32，会有浮点误差，展示接近 1 即可，不应要求字符串恰为 `1`。
 
 ## 调用方法与返回契约
 
@@ -85,7 +85,7 @@ curl -sS 'http://172.19.40.22:8424/v3/wiki/search' \
       "title": "原页面标题",
       "snippet": "页面摘要",
       "type": "source",
-      "score": 0.92,
+      "score": 2,
       "similarity": 0.92,
       "hop": 0,
       "related": []
@@ -93,7 +93,8 @@ curl -sS 'http://172.19.40.22:8424/v3/wiki/search' \
     "links": [],
     "count": 1,
     "retrieval": {
-      "mode": "case_vector",
+      "mode": "hybrid",
+      "strict_similarity": true,
       "model": "kinfra-vl-embedding-8b",
       "revision": "当前页面版本指纹",
       "min_similarity": 0.85,
@@ -115,11 +116,11 @@ curl -sS 'http://172.19.40.22:8424/v3/wiki/search' \
 
 模型不可用、超时、查询过载、向量索引缺失或版本落后时 HTTP 503，message 形如 `case_vector_unavailable: timeout` / `index_stale` / `vector_unavailable`。这是服务失败，不能当作“无相似判例”；由调用方按业务重试或错误处理。判例库首次索引完成前也是不可用，不回退关键词。
 
-`POST /v3/wiki/vector/status`，body `{"wiki_id":"wiki-ctrs7572"}`，可查看 `ready`、`building`、`pages`、`excluded_pages`、`input_mode`、`min_similarity`、`retrieval_mode`。BM25 库返回 `enabled: false, retrieval_mode: bm25`，不会暴露一个正在生效的 0.85 向量门槛。
+`POST /v3/wiki/vector/status`，body `{"wiki_id":"wiki-ctrs7572"}`，可查看 `ready`、`building`、`pages`、`excluded_pages`、`input_mode`、`min_similarity`、`retrieval_mode`。当前普通库与判例库均显示 `retrieval_mode: hybrid`；判例额外显示 `strict_similarity: true`。普通库没有全结果 0.85 门槛。显式配置为 BM25 的库显示 `enabled: false, retrieval_mode: bm25`。
 
 若 BPO 缓存过旧结果，应清缓存或等原 TTL 过去，再比较新接口响应；MemoryHub 此次没有新增查询结果缓存。检索门槛只保证向量相关性，不代表最终审核精度已通过标注集验收。
 
-## 线上复现结果（2026-11-20 14:15，北京时间）
+## 历史复现结果（2026-11-20 14:15，纯向量版本）
 
 | 查询 | 线上返回 | 相似度 |
 | --- | --- | --- |
@@ -129,7 +130,7 @@ curl -sS 'http://172.19.40.22:8424/v3/wiki/search' \
 
 上述为线上单次请求样本；相同查询的模型分值存在小幅波动，实测同例后续请求约 0.996088，仍只命中自身。每条是否达到门槛，以该次响应的 `similarity` 为准。
 
-真实 TokenHub 模型验证原生与工具入口命中路径一致。正式库在独立副本的 24 组 BM25 对照一致；上线后 4 个非判例库的 61 项检索/正文检查一致，默认查询已恢复原 BM25。17,656 个受保护正文/原始材料文件哈希未变化。
+真实 TokenHub 模型验证原生与工具入口命中路径一致。正式库在独立副本的 24 组 BM25 对照一致；上线后 4 个非判例库的 61 项检索/正文检查一致，当时默认查询恢复为原 BM25，现已改为默认混合检索。17,656 个受保护正文/原始材料文件哈希未变化。
 
 ## 动态文本判例库的配置
 
@@ -147,4 +148,4 @@ curl -sS 'http://172.19.40.22:8424/v3/wiki/search' \
 
 该条配置合入现有 `KNOWLEDGE_WIKI_RETRIEVAL_POLICIES`，保留其他库策略。其向量索引标识包含原文前缀，防止更换提取方式后误用旧映射；资料文本库默认前缀仍复用原索引。空结果、每条 similarity、禁止兜底和故障 503 契约均与资料文本库相同。
 
-2026-11-20 15:51 已部署：动态文本库向量 ready，2,706 条判例参与检索，4 个结构/说明页排除。全部原文与完整知识记录一致；两条真实原文查询和无关查询分别验证召回自身、返回空。正式知识库保持原 BM25。
+2026-11-20 15:51 已部署：动态文本库向量 ready，2,706 条判例参与检索，4 个结构/说明页排除。全部原文与完整知识记录一致；两条真实原文查询和无关查询分别验证召回自身、返回空。当时正式知识库保持原 BM25，现已改为默认混合检索。

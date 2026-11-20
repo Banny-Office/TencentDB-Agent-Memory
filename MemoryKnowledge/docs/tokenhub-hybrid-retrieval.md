@@ -1,56 +1,45 @@
-# TokenHub 知识检索策略
+# Wiki 统一混合检索
 
-当前线上策略已改为：判例库只使用原文向量、逐条过滤 0.85 且不回退；其他 Wiki 恢复 BM25。接入契约、原文提取位置与错误处理见 [case-retrieval-contract.md](case-retrieval-contract.md)。以下混合检索说明仅适用于单独配置为 `hybrid` 的 Wiki，不能作为判例库的行为说明。
+所有 Wiki 默认 BM25 与向量双路召回，使用 RRF 融合排序。原生 `/v3/wiki/search`、`/v3/tools/call` 的 search 和转发这些 HTTP 接口的 MCP 工具使用同一策略。
 
-Wiki 的原生 `/v3/wiki/search` 和 `/v3/tools/call` search 工具共用混合检索。原请求不需要修改；`results`、`links`、`count` 保持原结构和 limit 语义。原有同步 MCP Wiki 引擎仍使用 BM25。
+| 类型 | 向量输入 | 过滤及降级 |
+| --- | --- | --- |
+| 普通知识库及新 Wiki | 标题 + 全页 Markdown，每 1800 Unicode 字符分块聚合 | 默认无 0.85 硬门槛；模型或索引不可用时回退 BM25 |
+| 资料文本判例库 | “规则正文”中的资料文本判例原文 | 两路候选均逐条要求 cosine ≥ 0.85；无命中返回空；故障 503 |
+| 动态文本判例库 | “规则正文”中的动态文本判例原文 | 同上 |
 
-## 运行配置
+原文位置、每条 similarity、错误处理和完整示例见 [case-retrieval-contract.md](case-retrieval-contract.md)。
+
+## 配置
 
 ```dotenv
 KNOWLEDGE_EMBEDDING_ENABLED=true
 KNOWLEDGE_EMBEDDING_PROVIDER=tokenhub
 KNOWLEDGE_EMBEDDING_BASE_URL=https://tokenhub.tencentmaas.com/v1
 KNOWLEDGE_EMBEDDING_MODEL=kinfra-vl-embedding-8b
-KNOWLEDGE_EMBEDDING_DIMENSION=4096
-KNOWLEDGE_EMBEDDING_API_KEY=<从受保护的环境注入，不提交 Git>
+KNOWLEDGE_EMBEDDING_API_KEY=<受保护的环境变量>
 KNOWLEDGE_EMBEDDING_CONCURRENCY=4
-KNOWLEDGE_RETRIEVAL_MODE=bm25
+KNOWLEDGE_RETRIEVAL_MODE=hybrid
 KNOWLEDGE_VECTOR_MIN_SIMILARITY=0
-KNOWLEDGE_WIKI_RETRIEVAL_POLICIES={"wiki-ctrs7572":{"mode":"case","min_similarity":0.85},"wiki-zz5wwtdt":{"mode":"bm25"}}
+KNOWLEDGE_WIKI_RETRIEVAL_POLICIES={"wiki-ctrs7572":{"mode":"case","min_similarity":0.85},"wiki-j2g1em91":{"mode":"case","min_similarity":0.85,"case_prefix":"动态文本质检判例：「"}}
 ```
 
-调用 TokenHub `/embeddings/multimodal`，每次提交一个文本块，返回一个融合向量。不能将多篇文档放在同一 input 中当作独立 batch。按 Unicode 字符每 1800 字切块，各块归一化向量求和后再次归一化为页面向量，与 DKE 的页面聚合方式一致。
+`mode: case` 是严格判例混合策略。普通库没有逐库锁定时可通过请求 `retrieval: bm25` 进行对照，不能用此参数绕过判例门槛。显式逐库策略始终优先。
 
-## 生命周期及隔离
+TokenHub 请求为 `/embeddings/multimodal`，每次只提交一个文本，4096 维。整页模式按 1800 字符分块，归一化向量求和后再次归一化；判例模式直接向量化原文。前缀、输入方式、端点、模型、维度参与索引隔离；融合方式变化不需要重新生成已有向量。
 
-- 向量构建、模型网络请求和全量向量相似度计算都在独立 worker 中进行。全局只运行一个 Wiki 构建，每个构建最多 4 个模型请求（可配置 1–8）。查询最多 4 个 worker，排队过多时直接回退。
-- 同一 Wiki 的只读请求允许并行，写入仍互斥并等待已有读取完成；排队的写入优先于后来的读取，避免批量审核请求被逐条串行处理。向量查询含排队在内最多等待 5 秒。
-- BM25 的同一事务发布全文内容指纹。向量构建验证磁盘快照和指纹相同，再原子发布完整页面映射；模型失败保留缓存和旧映射，不改变 Wiki 的 ready/failed 状态。
-- 向量索引按服务目录、Wiki、端点、模型、维度、分块版本隔离，位于 Wiki 的 `.hybrid/`。正文内容哈希用于复用未变化页面。删除及更新后，指纹不一致的旧向量不能参与查询。
-- 查询仅计算查询向量，先保留余弦相似度 ≥ 0.85 的向量候选，再与 BM25 用 RRF 融合，再沿用原有图扩展、正文路径、摘要和读取方式。
-- 模型不可用、超过查询时间预算、向量索引缺失或落后时返回 BM25，客户端不需要处理向量服务错误。状态及日志可以区分回退和真正的混合检索。
-- 本次没有引入 reranker，也没有改变审核模型或规则。向量检索不保证最终审核准确率提高，仍须用人工标注案例验证召回和审核结果。
+## 候选与分数
 
-## 验证及诊断
+普通库沿用 BM25 + 向量 RRF 和可选图扩展。判例库先召回 BM25 候选和向量前若干名，并计算所有 BM25 候选的原文相似度，丢掉低于门槛及无原文向量者，再融合两路的合格结果。每路从 0 开始的 rank 贡献 `61 / (61 + rank)`，双路首位的融合分为 2。
 
-```json
-{"wiki_id":"wiki-ctrs7572","query":"待审内容或知识问题","limit":8}
-```
+`score` 是融合分；判例的 `similarity` 是余弦相似度。请用 similarity 核对 0.85，不要用 score。判例响应为 `retrieval.mode: hybrid, strict_similarity: true`，仍有 `min_similarity: 0.85` 和 `input_mode: case_original`。空结果带 `empty_reason: below_similarity_threshold`，无 BM25 兜底。普通库回退时 `mode: bm25` 且带 `fallback_reason`。
 
-逐库策略由 `KNOWLEDGE_WIKI_RETRIEVAL_POLICIES` 指定，优先于请求参数；未指定逐库策略时，默认模式由 `KNOWLEDGE_RETRIEVAL_MODE` 指定。未被逐库策略锁定的 Wiki，原生 search 请求可临时加 `"retrieval":"bm25"` 或 `"retrieval":"hybrid"` 进行同查询对比。混合模式响应额外包含：
+## 生命周期与隔离
 
-```json
-{"retrieval":{"mode":"hybrid","model":"kinfra-vl-embedding-8b","revision":"内容指纹","min_similarity":0.85}}
-```
+向量构建、网络调用和全量相似度计算在 worker 中。全局一个构建，每个构建最多 4 个并发模型请求；查询最多 4 个 worker，含排队最多等待 5 秒。只读并行，排队写入优先于后来的读。
 
-向量阈值可通过 `KNOWLEDGE_VECTOR_MIN_SIMILARITY` 配置为 0–1，默认 0（判例模式单独默认 0.85，包含边界）。它只作用于向量候选，不对 BM25 候选或图扩展结果做相似度过滤；返回的融合 score 也不是余弦相似度。没有合格向量候选时仍返回 BM25，标记 `fallback_reason=below_similarity_threshold`。阈值变化不改变索引版本，无需重新生成向量。
+页面写入、删除及 ingest 后自动增量更新。全文索引和向量映射核对内容指纹，未变原文复用向量；索引落后时不使用过期映射。判例未就绪返回 503；普通库可降级 BM25。
 
-响应 `retrieval.min_similarity` 和 vector/status 的 `min_similarity` 显示实际阈值。实际回退时 mode 为 `bm25`，带 `fallback_reason`。`POST /v3/wiki/vector/status`，body 为 `{"wiki_id":"..."}`，返回当前模型、ready、building、已发布页数和缓存页数；仍需 `X-Tdai-Service-Id`，先验证 Wiki 归属。ready=false 时不能宣称该库已使用向量。
+`POST /v3/wiki/vector/status` 可查看模型、ready、building、页数、revision、retrieval_mode 和判例前缀。配置 hybrid 并不等于实际使用了向量，以 ready 和每次查询响应为准。
 
-只有向量模式的 Wiki 会在后台建立索引；混合模式期间回退 BM25，判例模式未就绪时返回 503。页面写入/删除及 ingest 成功后自动增量更新向量。模型配置在重启后生效；改逐库策略为 `bm25` 可回退全文检索，向量文件不影响正文和原始材料。
-
-## 验证范围
-
-自动测试覆盖：无词面重合的语义命中、REST 返回兼容、显式 BM25 对照、租户隔离、模型失败回退、失败不改变库状态、删除不使用旧向量、未变页面缓存复用、主线程响应及协议/维度校验。上线前在独立数据副本核对旧检索结果，使用真实 TokenHub 模型验证查询及向量维度；不将测试资料写入正式 Wiki。
-
-接口参考：https://cloud.tencent.com/document/product/1823/133515
+验证覆盖候选在向量 top-K 之外仍能参与融合、强关键词命中但低于余弦门槛被排除、0.85 边界、模型失败、索引更新与删除、缓存复用、前缀隔离及查询不阻塞事件循环。真实查询验证不等同于标注集审核精度验收。

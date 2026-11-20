@@ -12,7 +12,7 @@ export function retrievalPolicy(wikiId:string, requested?:'bm25'|'hybrid', env=p
   if(!policies || typeof policies!=='object' || Array.isArray(policies))throw new Error('Invalid Wiki retrieval policies');
   const entry=Object.hasOwn(policies,wikiId)?policies[wikiId]:undefined;
   if(entry && !['bm25','hybrid','case'].includes(entry.mode))throw new Error('Invalid Wiki retrieval policy');
-  const mode=entry?.mode??requested??(env.KNOWLEDGE_RETRIEVAL_MODE==='hybrid'?'hybrid':'bm25');
+  const mode=entry?.mode??requested??(env.KNOWLEDGE_RETRIEVAL_MODE==='bm25'?'bm25':'hybrid');
   const minSimilarity=Number(entry?.min_similarity??(mode==='case'?0.85:env.KNOWLEDGE_VECTOR_MIN_SIMILARITY??0));
   if(!Number.isFinite(minSimilarity)||minSimilarity<0||minSimilarity>1)throw new Error('Invalid Wiki similarity threshold');
   const casePrefix=entry?.case_prefix??DEFAULT_CASE_PREFIX;

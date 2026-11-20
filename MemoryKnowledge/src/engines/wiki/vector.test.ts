@@ -181,10 +181,11 @@ describe('strict per-Wiki case retrieval',()=>{
     expect(requests.map(r=>r.input[0].text)).toEqual(expect.arrayContaining(['日结1109516670','天气晴天']));
     expect(requests.every(r=>!r.input[0].text.includes('质检结论'))).toBe(true);
     const result=await manager.searchAsync('wiki-test0000','账号 _at_threshold_',8,{retrieval:'bm25',hop:5,minScore:0});
-    expect(result.retrieval?.mode).toBe('case_vector');
+    expect(result.retrieval?.mode).toBe('hybrid');
     expect(result.results.map(r=>r.path)).toEqual(['wiki/case.md']);
     expect(result.results[0].similarity).toBeCloseTo(.85,6);
-    expect(result.results[0].score).toBe(result.results[0].similarity);
+    expect(result.results[0].score).toBeGreaterThan(1);
+    expect(result.retrieval?.strict_similarity).toBe(true);
     expect(result.results[0].related).toEqual([]);expect(result.links).toEqual([]);
     const miss=await manager.searchAsync('wiki-test0000','账号 _below_threshold_',8,{hop:5});
     expect(miss.count).toBe(0);expect(miss.retrieval?.empty_reason).toBe('below_similarity_threshold');
@@ -196,6 +197,22 @@ describe('strict per-Wiki case retrieval',()=>{
     await manager.syncAsync('wiki-test0000');await manager.reindexVectors('wiki-test0000');
     expect(requests.length).toBe(count);
     expect(configId({...vectorConfig()!,inputMode:'case_original'})).not.toBe(configId(vectorConfig()!));
+  });
+  it('fuses a qualified BM25 candidate outside dense top-K while rejecting a higher lexical match below the cosine gate',async()=>{
+    const {manager,path}=await fixture('case');
+    for(let i=0;i<25;i++)writeFileSync(join(path,'wiki',`case-${String(i).padStart(2,'0')}.md`),casePage('独立原文 '+i));
+    writeFileSync(join(path,'wiki','zz-late.md'),casePage('needle 稀有词原文'));
+    writeFileSync(join(path,'wiki','bad.md'),casePage('天气 needle needle needle'));
+    await manager.syncAsync('wiki-test0000');await manager.reindexVectors('wiki-test0000');
+    const result=await manager.searchAsync('wiki-test0000','needle _at_threshold_',8,{retrieval:'bm25',hop:5});
+    expect(result.retrieval?.mode).toBe('hybrid');expect(result.retrieval?.strict_similarity).toBe(true);
+    expect(result.results.some(r=>r.path==='wiki/zz-late.md')).toBe(true);
+    expect(result.results.some(r=>r.path==='wiki/bad.md')).toBe(false);
+    expect(result.results.every(r=>r.similarity!>=.85)).toBe(true);
+    expect(result.links).toEqual([]);
+    const below=await manager.searchAsync('wiki-test0000','needle _below_threshold_',8);
+    expect(below.results).toEqual([]);expect(below.retrieval?.empty_reason).toBe('below_similarity_threshold');
+    expect(retrievalPolicy('wiki-new',undefined,{}).mode).toBe('hybrid');
   });
   it('distinguishes service failure from an empty business miss in both HTTP entry points',async()=>{
     const {manager,path,fail}=await fixture('case');
