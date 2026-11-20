@@ -44,7 +44,7 @@ import { HIDDEN_TYPES, tokenize, writeIndex, scanWikiDir } from "./index-builder
 export { tokenize } from "./index-builder.js";
 import { rebuildWikiIndex } from "./index-worker-client.js";
 import { scheduleVectors, vectorHits, vectorStatus } from "./vector-client.js";
-import { fuse, vectorConfig } from "./vector-shared.js";
+import { CaseRetrievalUnavailable, fuse, retrievalPolicy, wikiVectorConfig } from "./vector-shared.js";
 import { DEFAULT_SCHEMA, DEFAULT_PURPOSE } from "./ingest-v2/template.js";
 
 const log = createLogger("wiki-mgr");
@@ -783,7 +783,7 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
       state.lastSyncAt = new Date().toISOString();
       state.error = undefined;
       persist();
-      void scheduleVectors(state.path);
+      void scheduleVectors(state.path,false,wikiVectorConfig(state.name));
       log.info("isolated index published", { name, pageCount: result.pageCount, ms: Date.now() - started });
       return state;
     } catch (error) {
@@ -862,28 +862,46 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
       throw err;
     }
     persist();
-    void scheduleVectors(state.path);
+    void scheduleVectors(state.path,false,wikiVectorConfig(state.name));
     return outcome.results;
   }
 
-  if(vectorConfig()) for(const state of [...sources.values()].filter(s=>s.status==='ready').sort((a,b)=>(a.pageCount??0)-(b.pageCount??0))) void scheduleVectors(state.path);
+  for(const state of [...sources.values()].filter(s=>s.status==='ready').sort((a,b)=>(a.pageCount??0)-(b.pageCount??0))) void scheduleVectors(state.path,false,wikiVectorConfig(state.name));
   return {
     register, sync, syncAsync, init, ingest,
-    vectorStatus: async name => {const state=sources.get(name);return state ? vectorStatus(state.path) : {enabled:false,ready:false};},
-    reindexVectors: async name => {const state=sources.get(name);if(!state)throw new Error('Wiki engine not registered');return scheduleVectors(state.path,true);},
+    vectorStatus: async name => {const state=sources.get(name);return {...(state ? await vectorStatus(state.path,wikiVectorConfig(name)) : {enabled:false,ready:false}),retrieval_mode:retrievalPolicy(name).mode};},
+    reindexVectors: async name => {const state=sources.get(name);if(!state)throw new Error('Wiki engine not registered');return scheduleVectors(state.path,true,wikiVectorConfig(name));},
     searchAsync: async (name,query,limit=DEFAULT_LIMIT,options={}) => {
-      const mode=options.retrieval ?? (process.env.KNOWLEDGE_RETRIEVAL_MODE === 'hybrid' ? 'hybrid' : 'bm25');
+      const policy=retrievalPolicy(name,options.retrieval),cfg=wikiVectorConfig(name,options.retrieval);
       const state=sources.get(name);
-      if(mode==='bm25' || !state || !vectorConfig()) return searchInternal(name,query,limit,options);
+      if(policy.mode==='case' && (!state || !cfg))throw new CaseRetrievalUnavailable('disabled');
+      if(policy.mode==='bm25'||!state||!cfg)return searchInternal(name,query,limit,options);
       const db=getReadDb(name,state.path);
       const current=(db.prepare('SELECT revision FROM index_revision WHERE id=1').get() as {revision:string}|undefined)?.revision;
-      if(!current)return searchInternal(name,query,limit,options);
+      if(!current){if(policy.mode==='case')throw new CaseRetrievalUnavailable('index_missing');return searchInternal(name,query,limit,options);}
       const count=limit>0 ? Math.min(limit,200) : DEFAULT_LIMIT;
-      const dense=await vectorHits(state.path,current,query,Math.max(count*2,20));
+      const dense=await vectorHits(state.path,current,query,Math.max(count*2,20),cfg);
       const latest=(getReadDb(name,state.path).prepare('SELECT revision FROM index_revision WHERE id=1').get() as {revision:string}|undefined)?.revision;
-      if(latest!==current){dense.hits=[];dense.reason='index_changed';void scheduleVectors(state.path);}
+      if(latest!==current){dense.hits=[];dense.reason='index_changed';void scheduleVectors(state.path,false,wikiVectorConfig(state.name));}
+      if(policy.mode==='case') {
+        if(dense.reason && dense.reason!=='below_similarity_threshold')throw new CaseRetrievalUnavailable(dense.reason);
+        return getReadDb(name,state.path).transaction(()=>{
+          const live=getReadDb(name,state.path);
+          if((live.prepare('SELECT revision FROM index_revision WHERE id=1').get() as {revision:string}|undefined)?.revision!==current)throw new CaseRetrievalUnavailable('index_changed');
+          const statement=live.prepare('SELECT title,type,rel_path,snippet FROM page_meta WHERE page_id=?');
+          const results:SearchResult[]=[];
+          for(const hit of dense.hits){
+            if(hit.score<cfg.minSimilarity)continue;
+            const row=statement.get(hit.id) as {title:string;type:string;rel_path:string;snippet:string}|undefined;
+            if(!row)continue;
+            results.push({path:row.rel_path,title:row.title,type:row.type,snippet:row.snippet,score:hit.score,similarity:hit.score,hop:0,related:[]});
+            if(results.length>=count)break;
+          }
+          return {results,links:[],count:results.length,retrieval:{mode:'case_vector',model:cfg.model,revision:current,min_similarity:cfg.minSimilarity,input_mode:'case_original',...(dense.reason?{empty_reason:dense.reason}:{})}} as SearchResponse;
+        })();
+      }
       const response=searchInternal(name,query,limit,options,{revision:current,hits:dense.hits});
-      response.retrieval={mode:dense.hits.length ? 'hybrid' : 'bm25',model:vectorConfig()!.model,revision:current,min_similarity:vectorConfig()!.minSimilarity,...(dense.reason?{fallback_reason:dense.reason}:{})};
+      response.retrieval={mode:dense.hits.length ? 'hybrid' : 'bm25',model:cfg.model,revision:current,min_similarity:cfg.minSimilarity,input_mode:cfg.inputMode,...(dense.reason?{fallback_reason:dense.reason}:{})};
       return response;
     },
     get: (name) => sources.get(name),

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import pLimit from 'p-limit';
 import { scanWikiDir } from './index-builder.js';
-import { configId, digest, embed, normalize, revision, type VectorConfig } from './vector-shared.js';
+import { caseOriginal, configId, digest, embed, normalize, revision, type VectorConfig } from './vector-shared.js';
 
 interface Job { kind:'build'|'search'|'status'; path:string; cfg:VectorConfig; revision?:string; query?:string; limit?:number }
 const job = workerData as Job;
@@ -28,10 +28,14 @@ async function main() {
       const pages = scanWikiDir(job.path);
       const target = revision(pages);
       if (target !== currentRevision()) throw new Error('Wiki changed during vector snapshot');
-      if (published(db) === target) return {ready:true,pages:pages.length,revision:target};
+      if (published(db) === target) return {ready:true,pages:(db.prepare('SELECT count(*) AS n FROM pages').get() as {n:number}).n,excluded_pages:Number((db.prepare("SELECT value FROM meta WHERE key='excluded_pages'").get() as {value:string}|undefined)?.value??0),revision:target};
       const slots = pLimit(job.cfg.concurrency);
       const pending = new Map<string,Promise<void>>();
-      const mappings = pages.map(page => ({id:page.id,hash:digest(page.title+'\n'+page.content),text:page.title+'\n'+page.content}));
+      const mappings = pages.flatMap(page => {
+        const text=job.cfg.inputMode==='case_original'?caseOriginal(page):page.title+'\n'+page.content;
+        return text ? [{id:page.id,hash:digest(text),text}] : [];
+      });
+      if(job.cfg.inputMode==='case_original' && !mappings.length)throw new Error('No case originals available');
       const lookup = db.prepare('SELECT 1 FROM cache WHERE hash=?');
       const save = db.prepare('INSERT OR REPLACE INTO cache VALUES (?,?)');
       let failure: unknown;
@@ -42,8 +46,9 @@ async function main() {
           try {
             const chars = Array.from(item.text);
             const sum = Array<number>(job.cfg.dimension).fill(0);
-            for (let offset=0;offset<chars.length;offset+=1800) {
-              const chunk=chars.slice(offset,offset+1800).join('');
+            const chunkSize=job.cfg.inputMode==='case_original'?Math.max(chars.length,1):1800;
+            for (let offset=0;offset<chars.length;offset+=chunkSize) {
+              const chunk=chars.slice(offset,offset+chunkSize).join('');
               if(!chunk.trim())continue; // TokenHub rejects whitespace-only trailing chunks.
               let vector: number[] | undefined;
               for (let attempt=0;attempt<3;attempt++) {
@@ -70,11 +75,12 @@ async function main() {
           insert.run(item.id,item.hash);
         }
         db.prepare('INSERT OR REPLACE INTO meta VALUES (?,?)').run('revision',target);
+        db.prepare('INSERT OR REPLACE INTO meta VALUES (?,?)').run('excluded_pages',String(pages.length-mappings.length));
       })();
-      return {ready:true,pages:pages.length,revision:target};
+      return {ready:true,pages:mappings.length,excluded_pages:pages.length-mappings.length,revision:target};
     }
     const target = published(db);
-    if(job.kind==='status') return {ready:target===currentRevision(),revision:target,pages:(db.prepare('SELECT count(*) AS n FROM pages').get() as {n:number}).n,cached:(db.prepare('SELECT count(*) AS n FROM cache').get() as {n:number}).n};
+    if(job.kind==='status') return {ready:target===currentRevision(),revision:target,pages:(db.prepare('SELECT count(*) AS n FROM pages').get() as {n:number}).n,cached:(db.prepare('SELECT count(*) AS n FROM cache').get() as {n:number}).n,excluded_pages:Number((db.prepare("SELECT value FROM meta WHERE key='excluded_pages'").get() as {value:string}|undefined)?.value??0)};
     if (target !== job.revision) return {hits:[],reason:'index_stale'};
     const query = await embed(job.query!,job.cfg,2500);
     return db.transaction(() => {
@@ -84,6 +90,7 @@ async function main() {
         if (row.vector.length !== job.cfg.dimension*4) throw new Error('Invalid stored vector');
         const vector = new Float32Array(row.vector.buffer.slice(row.vector.byteOffset,row.vector.byteOffset+row.vector.byteLength));
         let score=0;for(let i=0;i<query.length;i++) score+=query[i]*vector[i];
+        score=Math.max(-1,Math.min(1,score));
         if(score>=job.cfg.minSimilarity) hits.push({id:row.id,score});
       }
       hits.sort((a,b)=>b.score-a.score || a.id.localeCompare(b.id));

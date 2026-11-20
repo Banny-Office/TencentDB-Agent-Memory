@@ -1,4 +1,6 @@
-# TokenHub 混合知识检索
+# TokenHub 知识检索策略
+
+当前线上策略已改为：判例库只使用原文向量、逐条过滤 0.85 且不回退；其他 Wiki 恢复 BM25。接入契约、原文提取位置与错误处理见 [case-retrieval-contract.md](case-retrieval-contract.md)。以下混合检索说明仅适用于单独配置为 `hybrid` 的 Wiki，不能作为判例库的行为说明。
 
 Wiki 的原生 `/v3/wiki/search` 和 `/v3/tools/call` search 工具共用混合检索。原请求不需要修改；`results`、`links`、`count` 保持原结构和 limit 语义。原有同步 MCP Wiki 引擎仍使用 BM25。
 
@@ -12,8 +14,9 @@ KNOWLEDGE_EMBEDDING_MODEL=kinfra-vl-embedding-8b
 KNOWLEDGE_EMBEDDING_DIMENSION=4096
 KNOWLEDGE_EMBEDDING_API_KEY=<从受保护的环境注入，不提交 Git>
 KNOWLEDGE_EMBEDDING_CONCURRENCY=4
-KNOWLEDGE_RETRIEVAL_MODE=hybrid
-KNOWLEDGE_VECTOR_MIN_SIMILARITY=0.85
+KNOWLEDGE_RETRIEVAL_MODE=bm25
+KNOWLEDGE_VECTOR_MIN_SIMILARITY=0
+KNOWLEDGE_WIKI_RETRIEVAL_POLICIES={"wiki-ctrs7572":{"mode":"case","min_similarity":0.85},"wiki-zz5wwtdt":{"mode":"bm25"}}
 ```
 
 调用 TokenHub `/embeddings/multimodal`，每次提交一个文本块，返回一个融合向量。不能将多篇文档放在同一 input 中当作独立 batch。按 Unicode 字符每 1800 字切块，各块归一化向量求和后再次归一化为页面向量，与 DKE 的页面聚合方式一致。
@@ -34,17 +37,17 @@ KNOWLEDGE_VECTOR_MIN_SIMILARITY=0.85
 {"wiki_id":"wiki-ctrs7572","query":"待审内容或知识问题","limit":8}
 ```
 
-默认模式由 `KNOWLEDGE_RETRIEVAL_MODE` 指定。原生 search 请求可临时加 `"retrieval":"bm25"` 或 `"retrieval":"hybrid"` 进行同查询对比。混合模式响应额外包含：
+逐库策略由 `KNOWLEDGE_WIKI_RETRIEVAL_POLICIES` 指定，优先于请求参数；未指定逐库策略时，默认模式由 `KNOWLEDGE_RETRIEVAL_MODE` 指定。未被逐库策略锁定的 Wiki，原生 search 请求可临时加 `"retrieval":"bm25"` 或 `"retrieval":"hybrid"` 进行同查询对比。混合模式响应额外包含：
 
 ```json
 {"retrieval":{"mode":"hybrid","model":"kinfra-vl-embedding-8b","revision":"内容指纹","min_similarity":0.85}}
 ```
 
-向量阈值可通过 `KNOWLEDGE_VECTOR_MIN_SIMILARITY` 配置为 0–1，默认 0.85（包含边界）。它只作用于向量候选，不对 BM25 候选或图扩展结果做相似度过滤；返回的融合 score 也不是余弦相似度。没有合格向量候选时仍返回 BM25，标记 `fallback_reason=below_similarity_threshold`。阈值变化不改变索引版本，无需重新生成向量。
+向量阈值可通过 `KNOWLEDGE_VECTOR_MIN_SIMILARITY` 配置为 0–1，默认 0（判例模式单独默认 0.85，包含边界）。它只作用于向量候选，不对 BM25 候选或图扩展结果做相似度过滤；返回的融合 score 也不是余弦相似度。没有合格向量候选时仍返回 BM25，标记 `fallback_reason=below_similarity_threshold`。阈值变化不改变索引版本，无需重新生成向量。
 
 响应 `retrieval.min_similarity` 和 vector/status 的 `min_similarity` 显示实际阈值。实际回退时 mode 为 `bm25`，带 `fallback_reason`。`POST /v3/wiki/vector/status`，body 为 `{"wiki_id":"..."}`，返回当前模型、ready、building、已发布页数和缓存页数；仍需 `X-Tdai-Service-Id`，先验证 Wiki 归属。ready=false 时不能宣称该库已使用向量。
 
-首次上线会在后台依次索引现有 Wiki，较小库先完成；期间该库查询使用 BM25。页面写入/删除及 ingest 成功后自动增量更新向量。模型配置在重启后生效；`KNOWLEDGE_RETRIEVAL_MODE=bm25` 可回退全文检索，向量文件不影响正文和原始材料。
+只有向量模式的 Wiki 会在后台建立索引；混合模式期间回退 BM25，判例模式未就绪时返回 503。页面写入/删除及 ingest 成功后自动增量更新向量。模型配置在重启后生效；改逐库策略为 `bm25` 可回退全文检索，向量文件不影响正文和原始材料。
 
 ## 验证范围
 

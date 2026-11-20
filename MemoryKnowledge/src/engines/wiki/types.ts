@@ -62,6 +62,7 @@ export interface SearchResult {
   title: string;
   snippet: string;
   score: number;
+  similarity?:number;
   type: string;
   /** Min hop distance from a BM25 seed. 0 = direct BM25 hit, >0 = graph-expanded. */
   hop?: number;
@@ -72,7 +73,7 @@ export interface SearchResult {
 }
 
 export interface SearchResponse {
-  retrieval?: {mode:"bm25"|"hybrid";model:string;revision:string;min_similarity:number;fallback_reason?:string};
+  retrieval?: {mode:"bm25"|"hybrid"|"case_vector";model:string;revision:string;min_similarity:number;input_mode?:"page"|"case_original";fallback_reason?:string;empty_reason?:string};
   results: SearchResult[];
   /** Wikilink edges where both endpoints are in `results`. */
   links: ResultLink[];
