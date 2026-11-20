@@ -37,7 +37,7 @@ KNOWLEDGE_VECTOR_MIN_SIMILARITY=0.85
 默认模式由 `KNOWLEDGE_RETRIEVAL_MODE` 指定。原生 search 请求可临时加 `"retrieval":"bm25"` 或 `"retrieval":"hybrid"` 进行同查询对比。混合模式响应额外包含：
 
 ```json
-{"retrieval":{"mode":"hybrid","model":"kinfra-vl-embedding-8b","revision":"内容指纹"}}
+{"retrieval":{"mode":"hybrid","model":"kinfra-vl-embedding-8b","revision":"内容指纹","min_similarity":0.85}}
 ```
 
 向量阈值可通过 `KNOWLEDGE_VECTOR_MIN_SIMILARITY` 配置为 0–1，默认 0.85（包含边界）。它只作用于向量候选，不对 BM25 候选或图扩展结果做相似度过滤；返回的融合 score 也不是余弦相似度。没有合格向量候选时仍返回 BM25，标记 `fallback_reason=below_similarity_threshold`。阈值变化不改变索引版本，无需重新生成向量。

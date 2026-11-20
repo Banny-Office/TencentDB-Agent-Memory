@@ -14,3 +14,9 @@
 - 私有部署配置、元数据库备份及验证报告保存在服务器 `/Users/momo/apps/memoryhub-tokenhub-fixed-20261120`。上一轮构建和副本验证记录在 `/Users/momo/apps/memoryhub-tokenhub-20261120`。文件包含运行配置，不公开上传。
 
 接入和故障回退说明见 [tokenhub-hybrid-retrieval.md](tokenhub-hybrid-retrieval.md)。
+
+## 向量阈值调整（13:12）
+
+运行代码更新为 `bc92586`，镜像 `sha256:7ad94d1c9e1d65bc38c312d24a055d16a8a9953af0edce017a2f3747bbc77c91`。设置 `KNOWLEDGE_VECTOR_MIN_SIMILARITY=0.85`：先过滤余弦相似度低于 0.85 的向量候选，再融合 BM25。阈值含等号，不对 BM25 候选及图扩展结果施加该阈值。响应和 vector/status 暴露 `min_similarity`，无合格向量候选时说明 `below_similarity_threshold`。索引版本及缓存无需改变。
+
+15 项测试和 typecheck 通过，包括低于 0.85 被排除、边界 0.85 被保留及阈值变更复用缓存。独立副本验证 4 项 BM25 对照、3 项真实模型混合查询；线上切换后 61 项 BM25/正文对照及正文文件哈希一致。回滚容器为 `tdai-memory-hub-before-threshold085-20261120`；本次私有部署记录保存在 `/Users/momo/apps/memoryhub-threshold085-20261120`。
