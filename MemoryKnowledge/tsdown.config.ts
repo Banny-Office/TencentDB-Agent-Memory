@@ -10,7 +10,7 @@ function collectExternalDependencies(): string[] {
 }
 
 export default defineConfig({
-  entry: { server: "./src/server.ts", "mcp/server": "./src/mcp/server.ts", "index-worker": "./src/engines/wiki/index-worker.ts" },
+  entry: { server: "./src/server.ts", "mcp/server": "./src/mcp/server.ts", "index-worker": "./src/engines/wiki/index-worker.ts", "vector-worker":"./src/engines/wiki/vector-worker.ts" },
   outDir: "./dist",
   format: "esm",
   platform: "node",

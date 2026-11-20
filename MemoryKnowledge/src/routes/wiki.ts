@@ -469,6 +469,15 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     }
   });
 
+  app.post('/vector/status', async c => {
+    const body=await c.req.json<Record<string,unknown>>();
+    const serviceId=c.req.header('x-tdai-service-id');
+    if(!isValidIdSegment(serviceId)||!isValidIdSegment(body.wiki_id))return c.json(wrapError(400,'service and wiki_id required'),400);
+    const row=wikiService.getById(serviceId,body.wiki_id);
+    if(!row)return c.json(wrapError(404,'wiki not found'),404);
+    return c.json(wrapOk(await wikiMgr.vectorStatus(body.wiki_id)));
+  });
+
   // ═══════════════════ Derived Views (id-only) ═══════════════════
 
   app.post("/graph", async (c) => {
@@ -532,7 +541,8 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
       minScore = body.minScore;
     }
 
-    const response = wikiMgr.search(wikiId, query, limit, { hop, decay, minScore });
+    if(body.retrieval !== undefined && body.retrieval !== 'bm25' && body.retrieval !== 'hybrid') return c.json(wrapError(400,'retrieval must be bm25 or hybrid'),400);
+    const response = await wikiMgr.searchAsync(wikiId, query, limit, { hop, decay, minScore, retrieval:body.retrieval as 'bm25'|'hybrid'|undefined });
     return c.json(wrapOk(response));
   });
 

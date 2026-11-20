@@ -5,6 +5,7 @@ import { join, basename } from "node:path";
 import type DatabaseType from "better-sqlite3";
 import type { WikiPage } from "./types.js";
 import { slugify } from "./ingest-v2/slug.js";
+import { revision } from "./vector-shared.js";
 export const HIDDEN_TYPES = new Set(["query"]);
 
 function extractFrontmatter(content: string): { title: string; type: string; sources: string[]; description: string } {
@@ -174,6 +175,8 @@ export function tokenize(text: string): string[] {
 }
 
 export function writeIndex(db: DatabaseType.Database, pages: WikiPage[]): void {
+  db.exec('CREATE TABLE IF NOT EXISTS index_revision (id INTEGER PRIMARY KEY CHECK(id=1), revision TEXT NOT NULL)');
+  db.prepare('INSERT OR REPLACE INTO index_revision VALUES (1,?)').run(revision(pages));
   db.prepare("DELETE FROM wiki_fts").run();
   db.prepare("DELETE FROM page_meta").run();
   db.prepare("DELETE FROM graph_edge").run();

@@ -330,7 +330,7 @@ async function executeWikiTool(
         return Response.json(wrapOk({ results: [], links: [], count: 0 }));
       }
       const limit = typeof params.limit === "number" ? params.limit : 20;
-      const response = wikiMgr.search(wiki_id, query, limit);
+      const response = await wikiMgr.searchAsync(wiki_id, query, limit);
       return Response.json(wrapOk(response));
     }
     case "list_pages": {

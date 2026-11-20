@@ -43,6 +43,8 @@ import { getIngestConcurrency } from "../../config.js";
 import { HIDDEN_TYPES, tokenize, writeIndex, scanWikiDir } from "./index-builder.js";
 export { tokenize } from "./index-builder.js";
 import { rebuildWikiIndex } from "./index-worker-client.js";
+import { scheduleVectors, vectorHits, vectorStatus } from "./vector-client.js";
+import { fuse, vectorConfig } from "./vector-shared.js";
 import { DEFAULT_SCHEMA, DEFAULT_PURPOSE } from "./ingest-v2/template.js";
 
 const log = createLogger("wiki-mgr");
@@ -54,6 +56,7 @@ const log = createLogger("wiki-mgr");
 export interface SearchOptions {
   /** Multi-hop expansion depth (PRD FR-3). 0 = pure BM25. Range 0~5. */
   hop?: number;
+  retrieval?: "bm25" | "hybrid";
   /** Per-hop score decay factor (0~1). */
   decay?: number;
   /** Minimum score threshold; nodes below this are dropped. */
@@ -115,6 +118,9 @@ export interface WikiSourceManager {
   list(): WikiSourceState[];
   remove(name: string): void;
   search(name: string, query: string, limit?: number, options?: SearchOptions): SearchResponse;
+  searchAsync(name: string, query: string, limit?: number, options?: SearchOptions): Promise<SearchResponse>;
+  vectorStatus(name: string): Promise<unknown>;
+  reindexVectors(name: string): Promise<unknown>;
   graph(name: string): { nodes: GraphNode[]; edges: GraphEdge[]; communities: CommunityInfo[] };
   readPage(name: string, relPath: string): string | null;
   getPages(name: string): WikiPage[];
@@ -637,7 +643,7 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
     evictWikiDb(name); // 丢弃可能持有旧快照的读连接，下次查询重开
   }
 
-  function searchInternal(name: string, query: string, limit: number, options: SearchOptions): SearchResponse {
+  function searchInternal(name: string, query: string, limit: number, options: SearchOptions, dense?: {revision:string;hits:{id:string;score:number}[]}): SearchResponse {
     const state = sources.get(name);
     if (!state) return { results: [], links: [], count: 0 };
 
@@ -658,7 +664,9 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
       // Pull a slightly oversized seed pool so graph expansion still has something
       // to walk from when `limit` is small but `hop>0` is requested.
       const seedPoolSize = Math.max(finalLimit, hop > 0 ? finalLimit * 2 : finalLimit);
-      const rawSeeds = ftsSearch(db, query, seedPoolSize);
+      const lexical = ftsSearch(db, query, seedPoolSize);
+      const liveRevision = dense ? (db.prepare('SELECT revision FROM index_revision WHERE id=1').get() as {revision:string}|undefined)?.revision : undefined;
+      const rawSeeds = dense && liveRevision === dense.revision ? fuse(lexical,dense.hits).slice(0,seedPoolSize) : lexical;
       if (rawSeeds.length === 0) {
         return { results: [], links: [], count: 0 };
       }
@@ -775,6 +783,7 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
       state.lastSyncAt = new Date().toISOString();
       state.error = undefined;
       persist();
+      void scheduleVectors(state.path);
       log.info("isolated index published", { name, pageCount: result.pageCount, ms: Date.now() - started });
       return state;
     } catch (error) {
@@ -853,11 +862,30 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
       throw err;
     }
     persist();
+    void scheduleVectors(state.path);
     return outcome.results;
   }
 
+  if(vectorConfig()) for(const state of [...sources.values()].filter(s=>s.status==='ready').sort((a,b)=>(a.pageCount??0)-(b.pageCount??0))) void scheduleVectors(state.path);
   return {
     register, sync, syncAsync, init, ingest,
+    vectorStatus: async name => {const state=sources.get(name);return state ? vectorStatus(state.path) : {enabled:false,ready:false};},
+    reindexVectors: async name => {const state=sources.get(name);if(!state)throw new Error('Wiki engine not registered');return scheduleVectors(state.path,true);},
+    searchAsync: async (name,query,limit=DEFAULT_LIMIT,options={}) => {
+      const mode=options.retrieval ?? (process.env.KNOWLEDGE_RETRIEVAL_MODE === 'hybrid' ? 'hybrid' : 'bm25');
+      const state=sources.get(name);
+      if(mode==='bm25' || !state || !vectorConfig()) return searchInternal(name,query,limit,options);
+      const db=getReadDb(name,state.path);
+      const current=(db.prepare('SELECT revision FROM index_revision WHERE id=1').get() as {revision:string}|undefined)?.revision;
+      if(!current)return searchInternal(name,query,limit,options);
+      const count=limit>0 ? Math.min(limit,200) : DEFAULT_LIMIT;
+      const dense=await vectorHits(state.path,current,query,Math.max(count*2,20));
+      const latest=(getReadDb(name,state.path).prepare('SELECT revision FROM index_revision WHERE id=1').get() as {revision:string}|undefined)?.revision;
+      if(latest!==current){dense.hits=[];dense.reason='index_changed';void scheduleVectors(state.path);}
+      const response=searchInternal(name,query,limit,options,{revision:current,hits:dense.hits});
+      response.retrieval={mode:dense.hits.length ? 'hybrid' : 'bm25',model:vectorConfig()!.model,revision:current,...(dense.reason?{fallback_reason:dense.reason}:{})};
+      return response;
+    },
     get: (name) => sources.get(name),
     list: () => [...sources.values()],
     remove: (name) => {
