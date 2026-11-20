@@ -228,6 +228,24 @@ describe('strict per-Wiki case retrieval',()=>{
       expect(response.status).toBe(503);expect(JSON.stringify(await response.json())).toContain('case_vector_unavailable');
     }
   });
+  it('reserves case query capacity while ordinary hybrid searches occupy their queue',async()=>{
+    const {manager,path,requests,delay}=await fixture('case');
+    writeFileSync(join(path,'wiki','case.md'),casePage('专用判例原文'));
+    await manager.syncAsync('wiki-test0000');await manager.reindexVectors('wiki-test0000');
+    const ordinary=join(path,'..','ordinary');mkdirSync(join(ordinary,'wiki'),{recursive:true});
+    writeFileSync(join(ordinary,'wiki','normal.md'),'# 普通知识\n说明');
+    manager.register({name:'wiki-normal00',path:ordinary});clean.push(()=>manager.remove('wiki-normal00'));
+    await manager.reindexVectors('wiki-normal00');
+    delay(700);const count=requests.length;let completed=0;
+    const queries=Array.from({length:8},()=>manager.searchAsync('wiki-normal00','普通查询',8).then(r=>{completed++;return r;}));
+    try {
+      for(let i=0;i<100&&requests.length-count<4;i++)await new Promise(resolve=>setTimeout(resolve,10));
+      expect(requests.length-count).toBeGreaterThanOrEqual(4);
+      const result=await manager.searchAsync('wiki-test0000','专用判例原文',8);
+      expect(result.retrieval?.mode).toBe('hybrid');expect(result.results[0].similarity).toBeCloseTo(1);
+      expect(completed).toBeLessThan(8);
+    } finally {await Promise.all(queries);}
+  });
   it('keeps formal knowledge on unchanged BM25 without starting embeddings',async()=>{
     const {manager,requests}=await fixture('bm25');await manager.reindexVectors('wiki-test0000');
     expect(await manager.searchAsync('wiki-test0000','账号',8)).toEqual(manager.search('wiki-test0000','账号',8));
